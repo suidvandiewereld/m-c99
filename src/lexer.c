@@ -95,7 +95,7 @@ static void skip_whitespace_and_comments(Lexer *L) {
       advance(L);
       continue;
     }
-    /* Line directives: skip #... to end of line (no real preprocessor yet). */
+    /* Residual directives after preprocess (e.g. unknown): skip line. */
     if (c == '#') {
       while (!at_end(L) && peek(L) != '\n')
         advance(L);

@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -O2
 CPPFLAGS += -Isrc -Ilibmtlc/include
 SRCS = src/common.c src/token.c src/lexer.c src/ast.c src/ctype.c \
-       src/parser.c src/sema.c src/lower.c src/main.c
+       src/parser.c src/sema.c src/lower.c src/preprocess.c src/main.c
 OBJS = $(SRCS:src/%.c=build/%.o)
 
 ifeq ($(OS),Windows_NT)
