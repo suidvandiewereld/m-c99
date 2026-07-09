@@ -1,1 +1,5 @@
 libmtlc/docs
+bin/
+*.exe
+*.obj
+*.o
