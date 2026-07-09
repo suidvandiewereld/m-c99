@@ -64,6 +64,7 @@ Need (Run-Case "gaps/struct_return" @("tests\struct_return.c") 7 $null)
 Need (Run-Case "gaps/partial_zero" @("tests\partial_zero.c") 0 $null)
 Need (Run-Case "gaps/global_agg" @("tests\global_agg.c") 7 $null)
 Need (Run-Case "multifile/static_link" @("tests\static_a.c","tests\static_b.c") 0 $null)
+Need (Run-Case "gaps/static_shadow" @("tests\static_shadow.c") 0 $null)
 
 # -E check
 $Edir = Join-Path $Scratch "preprocess"

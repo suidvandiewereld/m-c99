@@ -43,6 +43,101 @@ static Program *compile_tu_stable(Arena *arena, Diag *diag, TypeContext *tc,
   return parse_program(&parser);
 }
 
+/* True if a decl chain introduces `name` as a local/param binding. */
+static int decl_chain_binds(Node *d, const char *name) {
+  for (; d; d = d->next) {
+    if ((d->kind == D_VAR || d->kind == D_FUNC || d->kind == D_TYPEDEF) &&
+        d->name && strcmp(d->name, name) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+/*
+ * Rename free uses of file-scope static `old` -> `mangled`, respecting
+ * block-scope shadowing (locals/params/typedefs with the same name).
+ */
+static void rename_static_uses(Node *n, const char *old, const char *mangled,
+                               int shadowed) {
+  if (!n)
+    return;
+
+  switch (n->kind) {
+  case ST_COMPOUND: {
+    int sh = shadowed;
+    for (size_t i = 0; i < buf_len(n->stmts); i++) {
+      Node *s = n->stmts[i];
+      if (s && s->kind == ST_DECL && decl_chain_binds(s->lhs, old))
+        sh = 1;
+      rename_static_uses(s, old, mangled, sh);
+    }
+    return;
+  }
+  case ST_FOR: {
+    int sh = shadowed;
+    if (n->init && n->init->kind == ST_DECL &&
+        decl_chain_binds(n->init->lhs, old))
+      sh = 1;
+    rename_static_uses(n->init, old, mangled, sh);
+    rename_static_uses(n->cond, old, mangled, sh);
+    rename_static_uses(n->inc, old, mangled, sh);
+    rename_static_uses(n->body, old, mangled, sh);
+    return;
+  }
+  case ST_DECL:
+    /* Initializers see outer scope for C99 (declarator not yet in scope for
+     * its own init in most cases); still, once this decl binds `old`, later
+     * siblings in the same chain keep the name. Do not rename the decl's
+     * own name field. */
+    for (Node *d = n->lhs; d; d = d->next) {
+      rename_static_uses(d->init, old, mangled, shadowed);
+      rename_static_uses(d->rhs, old, mangled, shadowed);
+    }
+    return;
+  case D_VAR:
+  case D_FUNC:
+  case D_TYPEDEF:
+    rename_static_uses(n->init, old, mangled, shadowed);
+    rename_static_uses(n->body, old, mangled, shadowed);
+    rename_static_uses(n->rhs, old, mangled, shadowed);
+    for (size_t i = 0; i < buf_len(n->params); i++)
+      rename_static_uses(n->params[i], old, mangled, shadowed);
+    return;
+  case EX_IDENT:
+    if (!shadowed && n->name && strcmp(n->name, old) == 0)
+      n->name = mangled;
+    return;
+  default:
+    break;
+  }
+
+  /* Function params shadow for the body. */
+  if (n->kind == D_FUNC && n->is_definition) {
+    int sh = shadowed;
+    for (size_t i = 0; i < buf_len(n->params); i++) {
+      Node *p = n->params[i];
+      if (p && p->name && strcmp(p->name, old) == 0)
+        sh = 1;
+    }
+    rename_static_uses(n->body, old, mangled, sh);
+    return;
+  }
+
+  rename_static_uses(n->lhs, old, mangled, shadowed);
+  rename_static_uses(n->rhs, old, mangled, shadowed);
+  rename_static_uses(n->cond, old, mangled, shadowed);
+  rename_static_uses(n->init, old, mangled, shadowed);
+  rename_static_uses(n->inc, old, mangled, shadowed);
+  rename_static_uses(n->body, old, mangled, shadowed);
+  rename_static_uses(n->els, old, mangled, shadowed);
+  for (size_t i = 0; i < buf_len(n->stmts); i++)
+    rename_static_uses(n->stmts[i], old, mangled, shadowed);
+  for (size_t i = 0; i < buf_len(n->params); i++)
+    rename_static_uses(n->params[i], old, mangled, shadowed);
+  if (n->next)
+    rename_static_uses(n->next, old, mangled, shadowed);
+}
+
 int main(int argc, char **argv) {
   const char *output = NULL;
   int opt_level = 1;
@@ -156,50 +251,26 @@ int main(int argc, char **argv) {
       return 1;
     }
     /* Internal linkage: mangle file-scope static names so multi-TU merge
-     * does not expose them to other units' externs. */
+     * does not expose them to other units' externs. Only free uses are
+     * rewritten; block-scope names that shadow the static are left alone. */
     for (size_t d = 0; d < buf_len(prog->decls); d++) {
       Node *decl = prog->decls[d];
       decl->tu_id = (int)i;
       if (decl->storage == SC_STATIC && decl->name &&
           (decl->kind == D_VAR || decl->kind == D_FUNC)) {
         const char *old = decl->name;
-        char *mangled =
-            arena_sprintf(&arena, "__st%zu_%s", i, old);
-        /* Rename references inside this TU's function bodies. */
+        char *mangled = arena_sprintf(&arena, "__st%zu_%s", i, old);
         for (size_t j = 0; j < buf_len(prog->decls); j++) {
           Node *fn = prog->decls[j];
-          if (fn->kind != D_FUNC || !fn->is_definition || !fn->body)
+          if (fn->kind != D_FUNC || !fn->is_definition)
             continue;
-          /* walk: rename EX_IDENT old -> mangled */
-          Node **stack = NULL;
-          buf_push(stack, fn->body);
-          while (buf_len(stack)) {
-            Node *n = stack[buf_len(stack) - 1];
-            BUF_HDR(stack)->len--;
-            if (!n)
-              continue;
-            if (n->kind == EX_IDENT && n->name && strcmp(n->name, old) == 0)
-              n->name = mangled;
-            if (n->lhs)
-              buf_push(stack, n->lhs);
-            if (n->rhs)
-              buf_push(stack, n->rhs);
-            if (n->cond)
-              buf_push(stack, n->cond);
-            if (n->init)
-              buf_push(stack, n->init);
-            if (n->inc)
-              buf_push(stack, n->inc);
-            if (n->body)
-              buf_push(stack, n->body);
-            if (n->els)
-              buf_push(stack, n->els);
-            for (size_t k = 0; k < buf_len(n->stmts); k++)
-              buf_push(stack, n->stmts[k]);
-            if (n->next)
-              buf_push(stack, n->next);
+          int sh = 0;
+          for (size_t p = 0; p < buf_len(fn->params); p++) {
+            Node *par = fn->params[p];
+            if (par && par->name && strcmp(par->name, old) == 0)
+              sh = 1;
           }
-          buf_free(stack);
+          rename_static_uses(fn->body, old, mangled, sh);
         }
         decl->name = mangled;
       }
