@@ -147,6 +147,7 @@ struct Node {
   int local_slot; /* filled by lowerer */
   Node **cases;   /* switch case list */
   int fptr_id;    /* function pointer id for lower */
+  int tu_id;      /* translation unit index for static linkage */
 };
 
 typedef struct {

@@ -598,8 +598,11 @@ static void check_decl(Sema *S, Node *d, int is_global) {
       return;
     }
     Symbol *sym = scope_insert(S, SYM_FUNC, d->name, d->type, d);
-    sym->is_extern = (d->storage == SC_EXTERN) || !d->is_definition;
+    sym->is_static = (d->storage == SC_STATIC);
+    sym->is_extern =
+        !sym->is_static && ((d->storage == SC_EXTERN) || !d->is_definition);
     sym->is_global = 1;
+    sym->link_name = d->name;
     if (d->is_definition)
       sym->is_defined = 1;
     d->sym = sym;
@@ -631,13 +634,20 @@ static void check_decl(Sema *S, Node *d, int is_global) {
       return;
     }
     Type *ty = d->type;
-    /* local arrays stay as arrays; params already decayed */
-    Symbol *sym = scope_insert(S, SYM_VAR, d->name, ty, d);
-    sym->is_extern = d->storage == SC_EXTERN;
-    sym->is_global = is_global || d->storage == SC_STATIC;
-    d->sym = sym;
-    if (sym->is_global)
-      buf_push(S->globals, sym);
+    Symbol *sym = d->sym;
+    if (!sym) {
+      sym = scope_insert(S, SYM_VAR, d->name, ty, d);
+      sym->is_static = (d->storage == SC_STATIC);
+      sym->is_extern = !sym->is_static && (d->storage == SC_EXTERN);
+      sym->is_global = is_global || d->storage == SC_STATIC;
+      sym->link_name = d->name;
+      d->sym = sym;
+      if (sym->is_global)
+        buf_push(S->globals, sym);
+    } else {
+      sym->type = ty;
+      d->type = ty;
+    }
     if (d->init)
       check_expr(S, d->init);
     return;
@@ -653,7 +663,9 @@ void sema_check(Sema *S, Program *prog) {
       d->type = d->decl_type;
       Symbol *sym = scope_insert(S, SYM_FUNC, d->name, d->type, d);
       sym->is_global = 1;
-      sym->is_extern = !d->is_definition;
+      sym->is_static = (d->storage == SC_STATIC);
+      sym->is_extern = !sym->is_static && !d->is_definition;
+      sym->link_name = d->name;
       if (d->is_definition)
         sym->is_defined = 1;
       d->sym = sym;
@@ -665,6 +677,16 @@ void sema_check(Sema *S, Program *prog) {
     } else if (d->kind == D_ENUM) {
       Symbol *sym = scope_insert(S, SYM_ENUM_CONST, d->name, S->tc->ty_int, d);
       sym->enum_val = d->ival;
+    } else if (d->kind == D_VAR && d->name) {
+      d->decl_type = resolve_type(S, d->decl_type);
+      d->type = d->decl_type;
+      Symbol *sym = scope_insert(S, SYM_VAR, d->name, d->type, d);
+      sym->is_global = 1;
+      sym->is_static = (d->storage == SC_STATIC);
+      sym->is_extern = !sym->is_static && (d->storage == SC_EXTERN);
+      sym->link_name = d->name;
+      d->sym = sym;
+      buf_push(S->globals, sym);
     }
   }
   /* Second pass: full check */

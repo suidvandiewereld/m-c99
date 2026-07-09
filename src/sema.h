@@ -13,12 +13,14 @@ typedef enum {
 
 typedef struct Symbol {
   SymKind kind;
-  const char *name;
+  const char *name;      /* source / lookup name (may be mangled for static) */
+  const char *link_name; /* IR/link name; defaults to name */
   Type *type;
   Node *decl;
   long long enum_val;
   int is_extern;
   int is_global;
+  int is_static; /* internal linkage */
   int is_defined;
   struct Symbol *next; /* hash chain */
 } Symbol;

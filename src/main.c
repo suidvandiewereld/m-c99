@@ -155,8 +155,56 @@ int main(int argc, char **argv) {
       buf_free(include_paths);
       return 1;
     }
-    for (size_t d = 0; d < buf_len(prog->decls); d++)
-      buf_push(merged->decls, prog->decls[d]);
+    /* Internal linkage: mangle file-scope static names so multi-TU merge
+     * does not expose them to other units' externs. */
+    for (size_t d = 0; d < buf_len(prog->decls); d++) {
+      Node *decl = prog->decls[d];
+      decl->tu_id = (int)i;
+      if (decl->storage == SC_STATIC && decl->name &&
+          (decl->kind == D_VAR || decl->kind == D_FUNC)) {
+        const char *old = decl->name;
+        char *mangled =
+            arena_sprintf(&arena, "__st%zu_%s", i, old);
+        /* Rename references inside this TU's function bodies. */
+        for (size_t j = 0; j < buf_len(prog->decls); j++) {
+          Node *fn = prog->decls[j];
+          if (fn->kind != D_FUNC || !fn->is_definition || !fn->body)
+            continue;
+          /* walk: rename EX_IDENT old -> mangled */
+          Node **stack = NULL;
+          buf_push(stack, fn->body);
+          while (buf_len(stack)) {
+            Node *n = stack[buf_len(stack) - 1];
+            BUF_HDR(stack)->len--;
+            if (!n)
+              continue;
+            if (n->kind == EX_IDENT && n->name && strcmp(n->name, old) == 0)
+              n->name = mangled;
+            if (n->lhs)
+              buf_push(stack, n->lhs);
+            if (n->rhs)
+              buf_push(stack, n->rhs);
+            if (n->cond)
+              buf_push(stack, n->cond);
+            if (n->init)
+              buf_push(stack, n->init);
+            if (n->inc)
+              buf_push(stack, n->inc);
+            if (n->body)
+              buf_push(stack, n->body);
+            if (n->els)
+              buf_push(stack, n->els);
+            for (size_t k = 0; k < buf_len(n->stmts); k++)
+              buf_push(stack, n->stmts[k]);
+            if (n->next)
+              buf_push(stack, n->next);
+          }
+          buf_free(stack);
+        }
+        decl->name = mangled;
+      }
+      buf_push(merged->decls, decl);
+    }
   }
 
   Sema sema;

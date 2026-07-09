@@ -59,6 +59,11 @@ Need (Run-Case "gaps/bitfield" @("tests\bitfield.c") 22 $null)
 Need (Run-Case "gaps/complex" @("tests\complex.c") 0 $null)
 Need (Run-Case "gaps/vla" @("tests\vla.c") 15 $null)
 Need (Run-Case "multifile" @("tests\multifile_a.c","tests\multifile_b.c") 42 $null)
+Need (Run-Case "gaps/struct_assign" @("tests\struct_assign.c") 0 $null)
+Need (Run-Case "gaps/struct_return" @("tests\struct_return.c") 7 $null)
+Need (Run-Case "gaps/partial_zero" @("tests\partial_zero.c") 0 $null)
+Need (Run-Case "gaps/global_agg" @("tests\global_agg.c") 7 $null)
+Need (Run-Case "multifile/static_link" @("tests\static_a.c","tests\static_b.c") 0 $null)
 
 # -E check
 $Edir = Join-Path $Scratch "preprocess"
