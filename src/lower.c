@@ -47,11 +47,11 @@ typedef struct {
   int has_sret;
   /* complex: I constant global */
   int complex_i_ready;
-  /* global aggregate names that need lazy malloc */
-  char **agg_globals;
-  size_t *agg_global_sizes;
-  /* file-scope pointer globals needing runtime string init */
-  Node **global_str_inits;
+  /* file-scope decls needing runtime ctor (strings, aggregates, &g, etc.) */
+  Node **global_runtime_inits;
+  /* all addressable object globals (name + size) for eager allocate in ctor */
+  char **agg_global_names;
+  size_t *agg_global_bytes;
   int need_global_init_call;
 } Lower;
 
@@ -60,6 +60,7 @@ static MtlcValue gen_expr(Lower *L, Node *e);
 static void gen_stmt(Lower *L, Node *st);
 static void gen_bool(Lower *L, Node *e, const char *true_l, const char *false_l);
 static MtlcValue gen_lvalue_addr(Lower *L, Node *e);
+static MtlcValue gen_string(Lower *L, const char *data, size_t len);
 static void gen_init_into(Lower *L, Type *ty, MtlcValue base_addr, Node *init,
                           size_t *seq_index);
 
@@ -389,6 +390,54 @@ static MtlcValue ensure_agg_global(Lower *L, const char *name, size_t bytes) {
   }
   mtlc_label(L->fn, done);
   return mtlc_global_ref(L->fn, name);
+}
+
+/* Apply one file-scope initializer inside __c99m_init_globals. */
+static void apply_global_init(Lower *L, Node *d) {
+  if (!d || !d->name)
+    return;
+  Type *ty = d->type;
+  int addr_obj = is_agg(ty) || (ty && ty->kind == TY_ARRAY) ||
+                 (d->sym && d->sym->address_taken);
+
+  if (addr_obj) {
+    size_t bytes = ty && ty->size ? ty->size : 8;
+    if (ty && ty->kind == TY_ARRAY && ty->array_len && ty->base)
+      bytes = ty->array_len * (ty->base->size ? ty->base->size : 1);
+    MtlcValue base = ensure_agg_global(L, d->name, bytes);
+    if (!d->init)
+      return;
+    if (d->init->kind == EX_INIT_LIST || d->init->kind == EX_COMPOUND_LITERAL ||
+        d->init->kind == EX_STRING) {
+      gen_init_into(L, ty, base, d->init, NULL);
+    } else if (ty && (ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+                      ty->kind == TY_COMPLEX || ty->kind == TY_ARRAY)) {
+      gen_init_into(L, ty, base, d->init, NULL);
+    } else {
+      /* Address-taken scalar: store rvalue through pointer. */
+      MtlcValue v = gen_expr(L, d->init);
+      v = cast_to(L, v, d->init->type, ty);
+      mtlc_store(L->fn, base, v, mtlc_of(ty));
+    }
+    return;
+  }
+
+  if (ty && ty->kind == TY_PTR && d->init) {
+    MtlcValue g = mtlc_global_ref(L->fn, d->name);
+    if (d->init->kind == EX_STRING) {
+      MtlcValue s = gen_string(L, d->init->str, d->init->str_len);
+      mtlc_assign(L->fn, g, s);
+      return;
+    }
+    if (d->init->kind == EX_UNARY && d->init->op == OP_ADDR) {
+      MtlcValue addr = gen_lvalue_addr(L, d->init->lhs);
+      mtlc_assign(L->fn, g, addr);
+      return;
+    }
+    /* General pointer init (including decays). */
+    MtlcValue v = gen_expr(L, d->init);
+    mtlc_assign(L->fn, g, v);
+  }
 }
 
 static int is_addr_global(Symbol *sym) {
@@ -1688,19 +1737,25 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
         init = d->init->ival;
       int is_extern = d->storage == SC_EXTERN;
       /* Aggregates, arrays, and address-taken scalars: pointer globals,
-       * lazily malloc'd on first use (stable addresses for &g). */
+       * allocated/inited in __c99m_init_globals (and lazily if missed). */
       int addr_obj = is_agg(d->type) || (d->type && d->type->kind == TY_ARRAY) ||
                      (d->sym && d->sym->address_taken);
       if (addr_obj) {
         mtlc_builder_global(L.builder, d->name, i8p_ty(), 0, is_extern);
-        buf_push(L.agg_globals, d->name);
         size_t sz = d->type && d->type->size ? d->type->size : 8;
-        buf_push(L.agg_global_sizes, sz);
-      } else if (d->init && d->init->kind == EX_STRING && d->type &&
-                 d->type->kind == TY_PTR) {
-        /* const char *g = "hi"; — set pointer at startup in init helper */
+        if (d->type && d->type->kind == TY_ARRAY && d->type->array_len &&
+            d->type->base)
+          sz = d->type->array_len *
+               (d->type->base->size ? d->type->base->size : 1);
+        buf_push(L.agg_global_names, d->name);
+        buf_push(L.agg_global_bytes, sz);
+        /* Always run through ctor so static initializers apply. */
+        buf_push(L.global_runtime_inits, d);
+      } else if (d->type && d->type->kind == TY_PTR && d->init &&
+                 d->init->kind != EX_INT) {
+        /* Pointer global with non-integer init (string, &obj, cast, ...). */
         mtlc_builder_global(L.builder, d->name, mtlc_of(d->type), 0, is_extern);
-        buf_push(L.global_str_inits, d);
+        buf_push(L.global_runtime_inits, d);
       } else {
         mtlc_builder_global(L.builder, d->name, mtlc_of(d->type), init,
                             is_extern);
@@ -1734,8 +1789,9 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
     }
   }
 
-  /* Runtime ctor for file-scope string pointer globals. */
-  if (buf_len(L.global_str_inits) > 0) {
+  /* Runtime ctor: allocate addressable globals, apply static initializers,
+   * materialize pointer-to-global and string pointer inits (declaration order). */
+  if (buf_len(L.global_runtime_inits) > 0) {
     L.need_global_init_call = 1;
     MtlcFn *initfn = mtlc_builder_function(
         L.builder, "__c99m_init_globals", mtlc_type_scalar(MTLC_TYPE_VOID), NULL,
@@ -1749,12 +1805,12 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
       L.has_va = 0;
       L.has_sret = 0;
       L.emitted_return = 0;
-      for (size_t gi = 0; gi < buf_len(L.global_str_inits); gi++) {
-        Node *d = L.global_str_inits[gi];
-        MtlcValue s = gen_string(&L, d->init->str, d->init->str_len);
-        MtlcValue g = mtlc_global_ref(L.fn, d->name);
-        mtlc_assign(L.fn, g, s);
-      }
+      /* Pass 1: allocate every addressable object global (null-initialized). */
+      for (size_t ai = 0; ai < buf_len(L.agg_global_names); ai++)
+        ensure_agg_global(&L, L.agg_global_names[ai], L.agg_global_bytes[ai]);
+      /* Pass 2: apply initializers in source order. */
+      for (size_t gi = 0; gi < buf_len(L.global_runtime_inits); gi++)
+        apply_global_init(&L, L.global_runtime_inits[gi]);
       mtlc_return(initfn, MTLC_NO_VALUE);
     }
   }

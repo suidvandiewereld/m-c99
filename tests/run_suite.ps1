@@ -66,6 +66,9 @@ Need (Run-Case "gaps/global_agg" @("tests\global_agg.c") 7 $null)
 Need (Run-Case "multifile/static_link" @("tests\static_a.c","tests\static_b.c") 0 $null)
 Need (Run-Case "gaps/static_shadow" @("tests\static_shadow.c") 0 $null)
 Need (Run-Case "gaps/storage_stack" @("tests\storage_stack.c") 0 $null)
+Need (Run-Case "gaps/global_agg_init" @("tests\global_agg_init.c") 7 $null)
+Need (Run-Case "gaps/global_array_init" @("tests\global_array_init.c") 6 $null)
+Need (Run-Case "gaps/addr_taken_global_init" @("tests\addr_taken_global_init.c") 0 $null)
 
 # -E check
 $Edir = Join-Path $Scratch "preprocess"

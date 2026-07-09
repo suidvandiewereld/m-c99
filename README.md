@@ -103,7 +103,8 @@ The driver always searches `include/` (C99 freestanding + CRT declarations:
 | Fixed local arrays / structs / unions / `_Complex` / compound literals | Stack: custom-size `MtlcType` + `mtlc_local` + `address_of` |
 | VLAs | Heap (`malloc`) — size not known at compile time |
 | String literals | Payload in packed `u64` data globals; one permanent heap buffer on first use (`address_of` on globals is not a reliable `char*` in the public API) |
-| File-scope aggregates / address-taken globals | Pointer global + lazy heap (stack would not outlive the function) |
+| File-scope aggregates / arrays / address-taken scalars | Pointer global; `__c99m_init_globals` (called from `main`) allocates and applies static initializers in declaration order |
+| File-scope `T *p = &g` / string pointer inits | Same ctor after objects exist |
 
 Debug info / IR source locations are not attached yet.
 
