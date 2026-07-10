@@ -40,6 +40,8 @@ int vprintf(const char *fmt, va_list ap);
 int vfprintf(FILE *f, const char *fmt, va_list ap);
 int vsprintf(char *buf, const char *fmt, va_list ap);
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+int _vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+int _snprintf(char *buf, size_t n, const char *fmt, ...);
 int scanf(const char *fmt, ...);
 int sscanf(const char *s, const char *fmt, ...);
 int fscanf(FILE *f, const char *fmt, ...);

@@ -117,6 +117,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share,
                    LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags,
                    HANDLE template_file);
 BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *read, void *ovl);
+BOOL PeekNamedPipe(HANDLE h, LPVOID buf, DWORD n, LPDWORD read,
+                   LPDWORD avail, LPDWORD left);
 BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written, void *ovl);
 BOOL CloseHandle(HANDLE h);
 BOOL FlushFileBuffers(HANDLE h);
