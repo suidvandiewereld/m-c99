@@ -645,8 +645,8 @@ static void bf_store(Lower *L, MtlcValue addr, StructMember *m, MtlcValue val) {
   mtlc_store(L->fn, addr, word, u32);
 }
 
-static StructMember *member_info(Type *st, const char *name) {
-  return type_find_member(st, name);
+static StructMember *member_info(Lower *L, Type *st, const char *name) {
+  return type_find_member(L->tc, st, name);
 }
 
 /* Complex as {double re; double im} at addr */
@@ -724,7 +724,7 @@ static void gen_init_into(Lower *L, Type *ty, MtlcValue base_addr, Node *init,
       Node *item = init->stmts[i];
       StructMember *m = NULL;
       if (item->is_designated && item->designator)
-        m = type_find_member(ty, item->designator);
+        m = type_find_member(L->tc, ty, item->designator);
       else {
         if (seq < buf_len(ty->members))
           m = &ty->members[seq];
@@ -1063,7 +1063,7 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
       Type *st = e->lhs->lhs->type;
       if (e->lhs->is_arrow && st && st->kind == TY_PTR)
         st = st->base;
-      StructMember *m = st ? member_info(st, e->lhs->name) : NULL;
+      StructMember *m = st ? member_info(L, st, e->lhs->name) : NULL;
       if (m && m->is_bitfield) {
         MtlcValue addr = gen_lvalue_addr(L, e->lhs);
         MtlcValue rhs = gen_expr(L, e->rhs);
@@ -1252,7 +1252,7 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
     Type *st = e->lhs->type;
     if (e->is_arrow && st && st->kind == TY_PTR)
       st = st->base;
-    StructMember *m = st ? member_info(st, e->name) : NULL;
+    StructMember *m = st ? member_info(L, st, e->name) : NULL;
     MtlcValue addr = gen_lvalue_addr(L, e);
     if (m && m->is_bitfield)
       return bf_load(L, addr, m);

@@ -428,12 +428,27 @@ Type *type_usual_arith(TypeContext *tc, Type *a, Type *b) {
   }
 }
 
-StructMember *type_find_member(Type *st, const char *name) {
+StructMember *type_find_member(TypeContext *tc, Type *st, const char *name) {
   if (!st)
     return NULL;
   for (size_t i = 0; i < buf_len(st->members); i++)
     if (st->members[i].name && strcmp(st->members[i].name, name) == 0)
       return &st->members[i];
+  /* recurse into anonymous struct/union members (C11 6.7.2.1p13),
+   * synthesizing a member whose offset is relative to the outer type */
+  for (size_t i = 0; i < buf_len(st->members); i++) {
+    StructMember *am = &st->members[i];
+    if (am->name || !am->type ||
+        (am->type->kind != TY_STRUCT && am->type->kind != TY_UNION))
+      continue;
+    StructMember *inner = type_find_member(tc, am->type, name);
+    if (inner) {
+      StructMember *r = (StructMember *)arena_calloc(tc->arena, sizeof(*r));
+      *r = *inner;
+      r->offset += am->offset;
+      return r;
+    }
+  }
   return NULL;
 }
 

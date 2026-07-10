@@ -122,6 +122,6 @@ Type *type_usual_arith(TypeContext *tc, Type *a, Type *b);
 int type_int_rank(const Type *t);
 
 const char *type_to_string(TypeContext *tc, const Type *t);
-StructMember *type_find_member(Type *st, const char *name);
+StructMember *type_find_member(TypeContext *tc, Type *st, const char *name);
 
 #endif /* C99M_CTYPE_H */

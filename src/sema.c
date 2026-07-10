@@ -421,7 +421,7 @@ static Type *check_expr(Sema *S, Node *e) {
       e->type = S->tc->ty_int;
       return e->type;
     }
-    StructMember *m = type_find_member(t, e->name);
+    StructMember *m = type_find_member(S->tc, t, e->name);
     if (!m) {
       diag_error(S->diag, e->loc, "no member named '%s'", e->name);
       e->type = S->tc->ty_int;
