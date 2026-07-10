@@ -53,7 +53,14 @@ typedef struct {
   char **agg_global_names;
   size_t *agg_global_bytes;
   int need_global_init_call;
+  /* extern functions already declared to the builder (stretchy) */
+  const char **declared_externs;
 } Lower;
+
+/* All calls to an extern variadic pad the tail to this arity so every call
+ * site agrees with one module-level signature (Win64 varargs read arg slots
+ * from memory, so extra zero i64 args are harmless). */
+#define C99M_VARIADIC_PAD 32
 
 static const MtlcType *mtlc_of(Type *t);
 static MtlcValue gen_expr(Lower *L, Node *e);
@@ -293,6 +300,68 @@ static MtlcValue alloc_bytes(Lower *L, size_t bytes, int is_vla,
   if (is_vla)
     return heap_bytes(L, 0, vla_bytes);
   return stack_bytes(L, bytes ? bytes : 1, NULL);
+}
+
+static int extern_is_declared(Lower *L, const char *name) {
+  for (size_t i = 0; i < buf_len(L->declared_externs); i++)
+    if (strcmp(L->declared_externs[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+/* Declare an extern function once with a prototype-accurate signature.
+ * Variadics get their fixed params plus an i64 tail padded to
+ * C99M_VARIADIC_PAD parameters so every call site can agree. */
+static void ensure_extern_fn(Lower *L, const char *name, Type *ft) {
+  if (extern_is_declared(L, name))
+    return;
+  buf_push(L->declared_externs, name);
+  size_t fixed = ft ? ft->param_count : 0;
+  int sret = ft && ft->base && is_agg(ft->base) && ft->base->kind != TY_ARRAY;
+  int variadic = ft && ft->is_variadic;
+  size_t nparams = variadic ? C99M_VARIADIC_PAD : fixed;
+  if (nparams < fixed)
+    nparams = fixed;
+  size_t total = nparams + (sret ? 1 : 0);
+  const char **pnames =
+      total ? (const char **)arena_alloc(L->arena, total * sizeof(char *))
+            : NULL;
+  const MtlcType **ptypes =
+      total ? (const MtlcType **)arena_alloc(L->arena, total * sizeof(MtlcType *))
+            : NULL;
+  size_t off = 0;
+  if (sret) {
+    pnames[0] = "__sret";
+    ptypes[0] = i8p_ty();
+    off = 1;
+  }
+  for (size_t j = 0; j < nparams; j++) {
+    pnames[off + j] = arena_sprintf(L->arena, "p%zu", j);
+    if (j < fixed)
+      ptypes[off + j] = mtlc_of(ft->params[j]);
+    else
+      ptypes[off + j] = mtlc_type_scalar(MTLC_TYPE_INT64);
+  }
+  const MtlcType *rt =
+      sret ? i8p_ty()
+           : (ft && ft->base && ft->base->kind != TY_VOID
+                  ? mtlc_of(ft->base)
+                  : mtlc_type_scalar(MTLC_TYPE_VOID));
+  mtlc_builder_function(L->builder, name, rt, pnames, ptypes, total, 1);
+}
+
+/* Reinterpret a float value's bits as i64 via a stack slot (for variadic
+ * tails: Win64 varargs read doubles from integer arg slots). */
+static MtlcValue float_bits_as_i64(Lower *L, MtlcValue v, const MtlcType *fty) {
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  const MtlcType *f64 = mtlc_type_scalar(MTLC_TYPE_FLOAT64);
+  /* default argument promotion: float -> double */
+  v = mtlc_cast(L->fn, v, f64);
+  (void)fty;
+  MtlcValue slot = alloc_bytes(L, 8, 0, MTLC_NO_VALUE);
+  mtlc_store(L->fn, slot, v, f64);
+  MtlcValue ip = mtlc_cast(L->fn, slot, mtlc_type_pointer(i64));
+  return mtlc_load(L->fn, ip, i64);
 }
 
 /* Zero `n` bytes at addr (C99 aggregate default zero). Unrolled for small n. */
@@ -678,7 +747,10 @@ static void cplx_load(Lower *L, MtlcValue addr, MtlcValue *re, MtlcValue *im) {
 
 static MtlcValue gen_indirect_call(Lower *L, MtlcValue fp, Node *call) {
   /* switch on function id */
-  MtlcValue result = mtlc_local(L->fn, fresh_tmp(L, "ic"), mtlc_of(call->type));
+  int is_void = call->type && call->type->kind == TY_VOID;
+  MtlcValue result =
+      is_void ? MTLC_NO_VALUE
+              : mtlc_local(L->fn, fresh_tmp(L, "ic"), mtlc_of(call->type));
   char *end = fresh_label(L, "icend");
   size_t n = buf_len(call->stmts);
   MtlcValue *args =
@@ -687,6 +759,11 @@ static MtlcValue gen_indirect_call(Lower *L, MtlcValue fp, Node *call) {
     args[i] = gen_expr(L, call->stmts[i]);
 
   for (size_t i = 0; i < L->nfptrs; i++) {
+    /* an entry with a different fixed arity cannot be this call's target */
+    Type *cand = L->fptrs[i].fn_type;
+    if (cand && cand->kind == TY_FUNC && !cand->is_variadic &&
+        cand->param_count != n)
+      continue;
     char *hit = fresh_label(L, "ichit");
     char *next = fresh_label(L, "icnext");
     MtlcValue id =
@@ -696,9 +773,11 @@ static MtlcValue gen_indirect_call(Lower *L, MtlcValue fp, Node *call) {
     mtlc_branch_if_zero(L->fn, eq, next);
     mtlc_label(L->fn, hit);
     Type *ft = L->fptrs[i].fn_type;
-    const MtlcType *rt = mtlc_of(ft->base);
+    int entry_void = ft->base && ft->base->kind == TY_VOID;
+    const MtlcType *rt =
+        entry_void ? mtlc_type_scalar(MTLC_TYPE_VOID) : mtlc_of(ft->base);
     MtlcValue r = mtlc_call(L->fn, L->fptrs[i].name, args, n, rt);
-    if (ft->base && ft->base->kind != TY_VOID)
+    if (!entry_void && !is_void)
       mtlc_assign(L->fn, result, r);
     mtlc_jump(L->fn, end);
     mtlc_label(L->fn, next);
@@ -763,8 +842,14 @@ static void gen_init_into(Lower *L, Type *ty, MtlcValue base_addr, Node *init,
       MtlcValue a = mtlc_cast(L->fn, base_addr, u64);
       MtlcValue addr = mtlc_binary(L->fn, "+", a, off, u64);
       addr = mtlc_cast(L->fn, addr, mtlc_type_pointer(mtlc_of(ty->base)));
-      MtlcValue v = gen_expr(L, item);
-      mtlc_store(L->fn, addr, v, mtlc_of(ty->base));
+      if (ty->base && is_agg(ty->base) &&
+          (item->kind == EX_INIT_LIST || item->kind == EX_STRING ||
+           item->kind == EX_COMPOUND_LITERAL)) {
+        gen_init_into(L, ty->base, addr, item, NULL);
+      } else {
+        MtlcValue v = gen_expr(L, item);
+        mtlc_store(L->fn, addr, v, mtlc_of(ty->base));
+      }
     }
     return;
   }
@@ -826,6 +911,9 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
         register_fptr(L, e->name, e->sym->type);
         id = fptr_id_for(L, e->name);
       }
+      if (e->sym->is_extern)
+        ensure_extern_fn(L, sym_link(e->sym) ? sym_link(e->sym) : e->name,
+                         e->sym->type);
       return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), id);
     }
     /* ptr_of locals always hold the base address of array/struct/complex
@@ -1018,6 +1106,11 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
           register_fptr(L, e->lhs->name, e->lhs->sym->type);
           id = fptr_id_for(L, e->lhs->name);
         }
+        if (e->lhs->sym->is_extern)
+          ensure_extern_fn(L,
+                           sym_link(e->lhs->sym) ? sym_link(e->lhs->sym)
+                                                 : e->lhs->name,
+                           e->lhs->sym->type);
         return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), id);
       }
       return gen_lvalue_addr(L, e->lhs);
@@ -1166,6 +1259,35 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
       if (lname)
         cname = lname;
       int sret = ft && is_agg(ft->base) && ft->base->kind != TY_ARRAY;
+      if (e->lhs->sym->is_extern)
+        ensure_extern_fn(L, cname, ft);
+      /* Extern variadic: fixed args per prototype, tail as i64 padded to the
+       * canonical arity (see C99M_VARIADIC_PAD). */
+      if (ft && ft->is_variadic && e->lhs->sym->is_extern) {
+        size_t fixed = ft->param_count;
+        size_t total = C99M_VARIADIC_PAD;
+        if (total < n)
+          total = n; /* over-long call: cannot pad consistently, best effort */
+        const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+        MtlcValue *args =
+            (MtlcValue *)arena_alloc(L->arena, (total ? total : 1) * sizeof(MtlcValue));
+        for (size_t i = 0; i < n; i++) {
+          MtlcValue v = gen_expr(L, e->stmts[i]);
+          if (i < fixed) {
+            args[i] = mtlc_cast(L->fn, v, mtlc_of(ft->params[i]));
+          } else if (e->stmts[i]->type && type_is_float(e->stmts[i]->type)) {
+            args[i] = float_bits_as_i64(L, v, mtlc_of(e->stmts[i]->type));
+          } else {
+            args[i] = mtlc_cast(L->fn, v, i64);
+          }
+        }
+        for (size_t i = n; i < total; i++)
+          args[i] = mtlc_const_int(L->fn, i64, 0);
+        const MtlcType *rt = mtlc_of(e->type);
+        if (e->type && e->type->kind == TY_VOID)
+          rt = mtlc_type_scalar(MTLC_TYPE_VOID);
+        return mtlc_call(L->fn, cname, args, total, rt);
+      }
       /* User-defined variadic: pack trailing args into buffer */
       if (ft && ft->is_variadic && !e->lhs->sym->is_extern) {
         size_t fixed = ft->param_count;
@@ -1209,29 +1331,13 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
         mtlc_call(L->fn, cname, args, n + 1, i8p_ty());
         return sret_buf;
       }
-      /* Extern variadic: redeclare symbol with this call's arity so codegen
-       * accepts the argument count (libmtlc checks call vs symbol). */
+      /* Plain direct call (extern already declared via prototype above). */
       MtlcValue *args =
           n ? (MtlcValue *)arena_alloc(L->arena, n * sizeof(MtlcValue)) : NULL;
-      const char **pnames =
-          n ? (const char **)arena_alloc(L->arena, n * sizeof(char *)) : NULL;
-      const MtlcType **ptypes =
-          n ? (const MtlcType **)arena_alloc(L->arena, n * sizeof(MtlcType *))
-            : NULL;
       for (size_t i = 0; i < n; i++) {
         args[i] = gen_expr(L, e->stmts[i]);
-        pnames[i] = arena_sprintf(L->arena, "a%zu", i);
-        ptypes[i] = mtlc_type_scalar(MTLC_TYPE_INT64);
-        if (e->stmts[i]->type && e->stmts[i]->type->kind == TY_PTR)
-          ptypes[i] = i8p_ty();
-        else if (e->stmts[i]->type && type_is_float(e->stmts[i]->type))
-          ptypes[i] = mtlc_of(e->stmts[i]->type);
-      }
-      if (e->lhs->sym && e->lhs->sym->is_extern) {
-        const MtlcType *rt0 = mtlc_of(e->type);
-        if (e->type && e->type->kind == TY_VOID)
-          rt0 = mtlc_type_scalar(MTLC_TYPE_VOID);
-        mtlc_builder_function(L->builder, cname, rt0, pnames, ptypes, n, 1);
+        if (e->lhs->sym->is_extern && ft && i < ft->param_count)
+          args[i] = mtlc_cast(L->fn, args[i], mtlc_of(ft->params[i]));
       }
       const MtlcType *rt = mtlc_of(e->type);
       if (e->type && e->type->kind == TY_VOID)
@@ -1761,31 +1867,10 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
                             is_extern);
       }
     } else if (d->kind == D_FUNC) {
-      Type *ft = d->type;
-      register_fptr(&L, d->name, ft);
-      if (!d->is_definition) {
-        size_t nparams = ft->param_count;
-        int is_sret = ft->base && is_agg(ft->base) && ft->base->kind != TY_ARRAY;
-        size_t irn = nparams + (is_sret ? 1 : 0);
-        const char **pnames =
-            irn ? (const char **)arena_alloc(L.arena, irn * sizeof(char *))
-                : NULL;
-        const MtlcType **ptypes =
-            irn ? (const MtlcType **)arena_alloc(L.arena, irn * sizeof(MtlcType *))
-                : NULL;
-        size_t off = 0;
-        if (is_sret) {
-          pnames[0] = "__sret";
-          ptypes[0] = i8p_ty();
-          off = 1;
-        }
-        for (size_t j = 0; j < nparams; j++) {
-          pnames[off + j] = arena_sprintf(L.arena, "p%zu", j);
-          ptypes[off + j] = mtlc_of(ft->params[j]);
-        }
-        const MtlcType *rt = is_sret ? i8p_ty() : mtlc_of(ft->base);
-        mtlc_builder_function(L.builder, d->name, rt, pnames, ptypes, irn, 1);
-      }
+      /* Prototypes are declared lazily at first reference (ensure_extern_fn)
+       * so unused CRT/Win32 declarations never enter the module. Definitions
+       * register their fptr id in gen_function. */
+      (void)0;
     }
   }
 
