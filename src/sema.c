@@ -113,6 +113,63 @@ static void sema_infer_array_len(Sema *S, Node *d) {
     d->sym->type = d->type;
 }
 
+/* Post-check constant fold over expression nodes (sizeof values live in
+ * e->ival after check_expr). Returns 1 when `e` is an integer constant. */
+static int sema_fold_const(Node *e, long long *out) {
+  if (!e)
+    return 0;
+  switch (e->kind) {
+  case EX_INT:
+  case EX_CHAR:
+    *out = e->ival;
+    return 1;
+  case EX_SIZEOF_EXPR:
+  case EX_SIZEOF_TYPE:
+    *out = e->ival;
+    return e->ival > 0;
+  case EX_IDENT:
+    if (e->sym && e->sym->kind == SYM_ENUM_CONST) {
+      *out = e->sym->enum_val;
+      return 1;
+    }
+    return 0;
+  case EX_CAST:
+    return sema_fold_const(e->lhs, out);
+  case EX_UNARY: {
+    long long v;
+    if (!sema_fold_const(e->lhs, &v))
+      return 0;
+    switch (e->op) {
+    case OP_NEG: *out = -v; return 1;
+    case OP_PLUS: *out = v; return 1;
+    case OP_BITNOT: *out = ~v; return 1;
+    case OP_NOT: *out = !v; return 1;
+    default: return 0;
+    }
+  }
+  case EX_BINARY: {
+    long long a, b;
+    if (!sema_fold_const(e->lhs, &a) || !sema_fold_const(e->rhs, &b))
+      return 0;
+    switch (e->op) {
+    case OP_ADD: *out = a + b; return 1;
+    case OP_SUB: *out = a - b; return 1;
+    case OP_MUL: *out = a * b; return 1;
+    case OP_DIV: if (!b) return 0; *out = a / b; return 1;
+    case OP_MOD: if (!b) return 0; *out = a % b; return 1;
+    case OP_LSHIFT: *out = a << (b & 63); return 1;
+    case OP_RSHIFT: *out = a >> (b & 63); return 1;
+    case OP_BITAND: *out = a & b; return 1;
+    case OP_BITOR: *out = a | b; return 1;
+    case OP_BITXOR: *out = a ^ b; return 1;
+    default: return 0;
+    }
+  }
+  default:
+    return 0;
+  }
+}
+
 /* ---- type resolution for typedef placeholders ---- */
 
 static Type *resolve_type(Sema *S, Type *t) {
@@ -855,6 +912,20 @@ static void check_decl(Sema *S, Node *d, int is_global) {
       return;
     }
     sema_infer_array_len(S, d);
+    /* VLA bound: type-check it, and if it folds to a constant (common with
+     * sizeof arithmetic the parser cannot fold), demote to a fixed array. */
+    if (d->rhs) {
+      check_expr(S, d->rhs);
+      long long n = 0;
+      if (d->type && d->type->kind == TY_ARRAY && d->type->is_vla &&
+          sema_fold_const(d->rhs, &n) && n > 0) {
+        d->type = type_array(S->tc, d->type->base, (size_t)n);
+        d->decl_type = d->type;
+        d->rhs = NULL;
+        if (d->sym)
+          d->sym->type = d->type;
+      }
+    }
     Type *ty = d->type;
     Symbol *sym = d->sym;
     if (!sym) {
