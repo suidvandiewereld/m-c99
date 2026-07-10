@@ -463,6 +463,25 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
   return st;
 }
 
+/* GCC asm label: `declarator __asm__("linkname")` — returns the link name
+ * or NULL. */
+static char *parse_asm_label(Parser *P) {
+  if (check(P, TK_IDENT) && P->tok.text &&
+      (strcmp(P->tok.text, "__asm__") == 0 ||
+       strcmp(P->tok.text, "__asm") == 0)) {
+    next(P);
+    expect(P, TK_LPAREN);
+    char *label = NULL;
+    if (check(P, TK_STRING)) {
+      label = P->tok.text;
+      next(P);
+    }
+    expect(P, TK_RPAREN);
+    return label;
+  }
+  return NULL;
+}
+
 /* ---- parse-time typedef table ---- */
 
 static void parser_typedef_register(Parser *P, const char *name, Type *ty) {
@@ -1379,6 +1398,26 @@ static Node *parse_decl_or_stmt(Parser *P) {
     Node *n = node_new(P->arena, D_STRUCT, P->tok.loc);
     n->decl_type = base;
     n->type = base;
+    /* block-scope `enum { A, B };` introduces enumerators */
+    if (base && base->kind == TY_ENUM && buf_len(base->members)) {
+      Node *first = NULL;
+      Node *prev = NULL;
+      for (size_t ei = 0; ei < buf_len(base->members); ei++) {
+        Node *en = node_new(P->arena, D_ENUM, n->loc);
+        en->name = base->members[ei].name;
+        en->ival = (long long)base->members[ei].offset;
+        en->type = base;
+        en->decl_type = base;
+        if (!first)
+          first = en;
+        else
+          prev->next = en;
+        prev = en;
+      }
+      Node *stmt = node_new(P->arena, ST_DECL, n->loc);
+      stmt->lhs = first;
+      return stmt;
+    }
     return n;
   }
 
@@ -1420,6 +1459,7 @@ static Node *parse_decl_or_stmt(Parser *P) {
     d->type = ty;
     d->storage = sc;
     d->rhs = vla_sz;
+    d->str = parse_asm_label(P);
     if (match(P, TK_ASSIGN))
       d->init = parse_initializer(P);
 
@@ -1510,6 +1550,7 @@ Program *parse_program(Parser *P) {
       d->decl_type = ty;
       d->type = ty;
       d->storage = sc;
+      d->str = parse_asm_label(P);
       if (match(P, TK_ASSIGN))
         d->init = parse_initializer(P);
       buf_push(prog->decls, d);

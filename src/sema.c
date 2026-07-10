@@ -716,7 +716,7 @@ void sema_check(Sema *S, Program *prog) {
       if (d->is_definition)
         sym->is_defined = 1;
       sym->is_extern = !sym->is_static && !sym->is_defined;
-      sym->link_name = d->name;
+      sym->link_name = d->str ? d->str : d->name; /* __asm__("name") label */
       d->sym = sym;
       buf_push(S->globals, sym);
     } else if (d->kind == D_TYPEDEF && d->name) {
