@@ -764,51 +764,16 @@ static void cplx_load(Lower *L, MtlcValue addr, MtlcValue *re, MtlcValue *im) {
 }
 
 static MtlcValue gen_indirect_call(Lower *L, MtlcValue fp, Node *call) {
-  /* switch on function id */
+  /* function pointers are real code addresses: call through the value */
   int is_void = call->type && call->type->kind == TY_VOID;
-  MtlcValue result =
-      is_void ? MTLC_NO_VALUE
-              : mtlc_local(L->fn, fresh_tmp(L, "ic"), mtlc_of(call->type));
-  char *end = fresh_label(L, "icend");
   size_t n = buf_len(call->stmts);
   MtlcValue *args =
       n ? (MtlcValue *)arena_alloc(L->arena, n * sizeof(MtlcValue)) : NULL;
   for (size_t i = 0; i < n; i++)
     args[i] = gen_expr(L, call->stmts[i]);
-
-  for (size_t i = 0; i < L->nfptrs; i++) {
-    /* an entry whose IR signature cannot match this call site is skipped:
-     * different fixed arity, variadic (hidden __va param convention), or
-     * aggregate return (hidden sret param). */
-    Type *cand = L->fptrs[i].fn_type;
-    if (cand && cand->kind == TY_FUNC) {
-      if (cand->is_variadic)
-        continue;
-      if (cand->param_count != n)
-        continue;
-      if (cand->base && is_agg(cand->base) && cand->base->kind != TY_ARRAY)
-        continue;
-    }
-    char *hit = fresh_label(L, "ichit");
-    char *next = fresh_label(L, "icnext");
-    MtlcValue id =
-        mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), L->fptrs[i].id);
-    MtlcValue eq =
-        mtlc_binary(L->fn, "==", fp, id, mtlc_type_scalar(MTLC_TYPE_INT32));
-    mtlc_branch_if_zero(L->fn, eq, next);
-    mtlc_label(L->fn, hit);
-    Type *ft = L->fptrs[i].fn_type;
-    int entry_void = ft->base && ft->base->kind == TY_VOID;
-    const MtlcType *rt =
-        entry_void ? mtlc_type_scalar(MTLC_TYPE_VOID) : mtlc_of(ft->base);
-    MtlcValue r = mtlc_call(L->fn, L->fptrs[i].name, args, n, rt);
-    if (!entry_void && !is_void)
-      mtlc_assign(L->fn, result, r);
-    mtlc_jump(L->fn, end);
-    mtlc_label(L->fn, next);
-  }
-  mtlc_label(L->fn, end);
-  return result;
+  const MtlcType *rt = is_void ? mtlc_type_scalar(MTLC_TYPE_VOID)
+                               : mtlc_of(call->type);
+  return mtlc_call_indirect(L->fn, fp, args, n, rt);
 }
 
 static void gen_init_into(Lower *L, Type *ty, MtlcValue base_addr, Node *init,
@@ -939,15 +904,10 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
       return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT32), 0);
     }
     if (e->sym->kind == SYM_FUNC) {
-      int id = fptr_id_for(L, e->name);
-      if (id < 0) {
-        register_fptr(L, e->name, e->sym->type);
-        id = fptr_id_for(L, e->name);
-      }
+      const char *ln = sym_link(e->sym) ? sym_link(e->sym) : e->name;
       if (e->sym->is_extern)
-        ensure_extern_fn(L, sym_link(e->sym) ? sym_link(e->sym) : e->name,
-                         e->sym->type);
-      return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), id);
+        ensure_extern_fn(L, ln, e->sym->type);
+      return mtlc_function_address(L->fn, ln);
     }
     /* ptr_of locals always hold the base address of array/struct/complex
      * storage. After array-to-pointer decay the AST type is TY_PTR — still
@@ -1141,17 +1101,11 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
     if (e->op == OP_ADDR) {
       if (e->lhs->kind == EX_IDENT && e->lhs->sym &&
           e->lhs->sym->kind == SYM_FUNC) {
-        int id = fptr_id_for(L, e->lhs->name);
-        if (id < 0) {
-          register_fptr(L, e->lhs->name, e->lhs->sym->type);
-          id = fptr_id_for(L, e->lhs->name);
-        }
+        const char *ln =
+            sym_link(e->lhs->sym) ? sym_link(e->lhs->sym) : e->lhs->name;
         if (e->lhs->sym->is_extern)
-          ensure_extern_fn(L,
-                           sym_link(e->lhs->sym) ? sym_link(e->lhs->sym)
-                                                 : e->lhs->name,
-                           e->lhs->sym->type);
-        return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), id);
+          ensure_extern_fn(L, ln, e->lhs->sym->type);
+        return mtlc_function_address(L->fn, ln);
       }
       return gen_lvalue_addr(L, e->lhs);
     }
@@ -1400,7 +1354,15 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
   }
   case EX_INDEX: {
     MtlcValue addr = gen_lvalue_addr(L, e);
-    if (e->type && is_agg(e->type))
+    /* The ELEMENT type decides value-vs-address: e->type may have been
+     * decayed in place by sema (e.g. as a call argument), which must not
+     * turn an aggregate element into an 8-byte load. */
+    Type *elem = e->type;
+    if (e->lhs->type &&
+        (e->lhs->type->kind == TY_ARRAY || e->lhs->type->kind == TY_PTR) &&
+        e->lhs->type->base)
+      elem = e->lhs->type->base;
+    if (elem && is_agg(elem))
       return addr;
     return mtlc_load(L->fn, addr, mtlc_of(e->type));
   }
@@ -1412,7 +1374,8 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
     MtlcValue addr = gen_lvalue_addr(L, e);
     if (m && m->is_bitfield)
       return bf_load(L, addr, m);
-    if (e->type && is_agg(e->type))
+    /* same in-place-decay hazard as EX_INDEX: judge by the member's type */
+    if ((m && m->type && is_agg(m->type)) || (e->type && is_agg(e->type)))
       return addr;
     return mtlc_load(L->fn, addr, mtlc_of(e->type));
   }
