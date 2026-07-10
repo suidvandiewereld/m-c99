@@ -767,8 +767,108 @@ static void install_predefs(PP *pp) {
     m->predefined = 1;
     macro_define(pp, m);
   }
+  /* MSVC/GCC decorations accepted as no-ops (Win64 has one calling
+   * convention; attributes do not affect this backend). */
+  const char *fn_noops[] = {"__declspec", "__attribute__", "__pragma", NULL};
+  for (int i = 0; fn_noops[i]; i++) {
+    Macro *m = (Macro *)arena_calloc(pp->arena, sizeof(Macro));
+    m->name = arena_strdup(pp->arena, fn_noops[i]);
+    m->function_like = 1;
+    buf_push(m->params, arena_strdup(pp->arena, "x"));
+    m->body = arena_strdup(pp->arena, "");
+    m->predefined = 1;
+    macro_define(pp, m);
+  }
+  const char *obj_noops[] = {"__stdcall", "__cdecl",       "__fastcall",
+                             "__forceinline", "__inline",  "__restrict",
+                             "__unaligned",   NULL};
+  for (int i = 0; obj_noops[i]; i++) {
+    Macro *m = (Macro *)arena_calloc(pp->arena, sizeof(Macro));
+    m->name = arena_strdup(pp->arena, obj_noops[i]);
+    m->body = arena_strdup(pp->arena, "");
+    m->predefined = 1;
+    macro_define(pp, m);
+  }
+  /* __builtin_popcount as a pure-expression macro (argument is evaluated
+   * multiple times; standard SWAR popcount). Composed programmatically so
+   * the parens are right by construction. */
+  {
+    const char *A =
+        "(((unsigned)(x)) - ((((unsigned)(x)) >> 1) & 0x55555555u))";
+    char *B = arena_sprintf(pp->arena,
+                            "(((%s) & 0x33333333u) + (((%s) >> 2) & "
+                            "0x33333333u))",
+                            A, A);
+    char *body = arena_sprintf(
+        pp->arena,
+        "((int)((((((%s) + ((%s) >> 4)) & 0x0f0f0f0fu) * 0x01010101u) >> 24) "
+        "& 0xff))",
+        B, B);
+    Macro *m = (Macro *)arena_calloc(pp->arena, sizeof(Macro));
+    m->name = arena_strdup(pp->arena, "__builtin_popcount");
+    m->function_like = 1;
+    buf_push(m->params, arena_strdup(pp->arena, "x"));
+    m->body = body;
+    m->predefined = 1;
+    macro_define(pp, m);
+  }
   /* Complex imaginary unit: only if user includes complex support.
    * Do NOT predefine bare `I` — it corrupts identifiers/comments (e.g. -I). */
+}
+
+/* Paren depth of one physical line, ignoring strings, chars, and comments.
+ * `*in_comment` carries block-comment state across lines. */
+static int line_paren_depth_c2(const char *s, int depth, int *in_comment,
+                               size_t *line_comment_at) {
+  size_t i = 0;
+  size_t n = strlen(s);
+  if (line_comment_at)
+    *line_comment_at = n;
+  while (i < n) {
+    if (*in_comment) {
+      if (s[i] == '*' && i + 1 < n && s[i + 1] == '/') {
+        *in_comment = 0;
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    char c = s[i];
+    if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+      if (line_comment_at)
+        *line_comment_at = i;
+      break;
+    }
+    if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+      *in_comment = 1;
+      i += 2;
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      char q = c;
+      i++;
+      while (i < n && s[i] != q) {
+        if (s[i] == '\\' && i + 1 < n)
+          i += 2;
+        else
+          i++;
+      }
+      if (i < n)
+        i++;
+      continue;
+    }
+    if (c == '(')
+      depth++;
+    else if (c == ')')
+      depth--;
+    i++;
+  }
+  return depth;
+}
+
+static int line_paren_depth_c(const char *s, int depth, int *in_comment) {
+  return line_paren_depth_c2(s, depth, in_comment, NULL);
 }
 
 /* Emit a GCC-style line marker: `# <line> "<file>"` — the lexer resyncs
@@ -790,6 +890,12 @@ static void emit_line_marker(char **out, int line, const char *path) {
 
 static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
                                size_t n0) {
+  /* skip UTF-8 BOM */
+  if (n0 >= 3 && (unsigned char)src0[0] == 0xEF &&
+      (unsigned char)src0[1] == 0xBB && (unsigned char)src0[2] == 0xBF) {
+    src0 += 3;
+    n0 -= 3;
+  }
   size_t n = 0;
   char *src = phase12(pp->arena, src0, n0, &n);
   char *out = NULL;
@@ -805,6 +911,9 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
   }
   buf_push(pp->include_stack, arena_strdup(pp->arena, path));
   emit_line_marker(&out, 1, path);
+
+  /* block-comment state persisting across physical text lines */
+  int text_in_comment = 0;
 
   while (i < n) {
     size_t line_start = i;
@@ -822,11 +931,11 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
     if (rl && raw[rl - 1] == '\r')
       raw[rl - 1] = 0;
 
-    /* directive? */
+    /* directive? (not when the line starts inside a block comment) */
     size_t k = 0;
     while (raw[k] == ' ' || raw[k] == '\t')
       k++;
-    if (raw[k] == '#') {
+    if (!text_in_comment && raw[k] == '#') {
       k++;
       while (raw[k] == ' ' || raw[k] == '\t')
         k++;
@@ -1044,9 +1153,42 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
     }
 
     if (!pp->output_disabled) {
-      char *exp = expand_line(pp, path, line, raw, 0);
+      /* Function-like macro invocations may span physical lines. If this
+       * line leaves '(' unbalanced (outside strings/chars/comments), merge
+       * following lines into one logical line, then pad with blank lines to
+       * preserve numbering. Directives stop the merge. */
+      int merged_lines = 0;
+      size_t cmt_at = 0;
+      int depth = line_paren_depth_c2(raw, 0, &text_in_comment, &cmt_at);
+      char *logical = raw;
+      if (depth > 0 && cmt_at < strlen(raw))
+        logical = arena_strndup(pp->arena, raw, cmt_at);
+      while (depth > 0 && next < n && merged_lines < 512) {
+        /* peek next line; stop at directives */
+        size_t ls = next;
+        size_t le = ls;
+        while (le < n && src[le] != '\n')
+          le++;
+        size_t k2 = ls;
+        while (k2 < le && (src[k2] == ' ' || src[k2] == '\t'))
+          k2++;
+        if (k2 < le && src[k2] == '#')
+          break;
+        char *nraw = arena_strndup(pp->arena, src + ls, le - ls);
+        size_t nl = strlen(nraw);
+        if (nl && nraw[nl - 1] == '\r')
+          nraw[nl - 1] = 0;
+        logical = arena_sprintf(pp->arena, "%s %s", logical, nraw);
+        depth = line_paren_depth_c(nraw, depth, &text_in_comment);
+        next = (le < n) ? le + 1 : le;
+        merged_lines++;
+      }
+      char *exp = expand_line(pp, path, line, logical, 0);
       for (char *q = exp; *q; q++)
         buf_push(out, *q);
+      for (int m = 0; m < merged_lines; m++)
+        buf_push(out, '\n');
+      line += merged_lines;
     }
     buf_push(out, '\n');
     i = next;
