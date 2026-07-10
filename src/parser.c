@@ -443,7 +443,12 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
           }
           type_struct_add_bitfield(P->tc, st, name, ty, (int)w);
         } else if (!name) {
-          diag_error(P->diag, P->tok.loc, "expected member name");
+          if (ty && (ty->kind == TY_STRUCT || ty->kind == TY_UNION)) {
+            /* anonymous struct/union member (C11 6.7.2.1p13) */
+            type_struct_add_member(P->tc, st, NULL, ty);
+          } else {
+            diag_error(P->diag, P->tok.loc, "expected member name");
+          }
         } else {
           type_struct_add_member(P->tc, st, name, ty);
         }
@@ -456,6 +461,126 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
       type_tag_register(P->tc, st);
   }
   return st;
+}
+
+/* ---- parse-time typedef table ---- */
+
+static void parser_typedef_register(Parser *P, const char *name, Type *ty) {
+  if (!name || !ty)
+    return;
+  for (size_t i = 0; i < buf_len(P->typedef_names); i++)
+    if (strcmp(P->typedef_names[i], name) == 0) {
+      P->typedef_types[i] = ty;
+      return;
+    }
+  buf_push(P->typedef_names, name);
+  buf_push(P->typedef_types, ty);
+}
+
+static Type *parser_typedef_lookup(Parser *P, const char *name) {
+  for (size_t i = 0; i < buf_len(P->typedef_names); i++)
+    if (strcmp(P->typedef_names[i], name) == 0)
+      return P->typedef_types[i];
+  return NULL;
+}
+
+/* ---- parse-time enumerator table + AST constant folder ---- */
+
+static void parser_enum_register(Parser *P, const char *name, long long val) {
+  buf_push(P->enum_names, name);
+  buf_push(P->enum_vals, val);
+}
+
+static int parser_enum_lookup(Parser *P, const char *name, long long *out) {
+  for (size_t i = buf_len(P->enum_names); i > 0; i--)
+    if (strcmp(P->enum_names[i - 1], name) == 0) {
+      *out = P->enum_vals[i - 1];
+      return 1;
+    }
+  return 0;
+}
+
+/* Fold an already-parsed expression to an integer constant (C99 6.6).
+ * Returns 1 on success. Handles literals, enum constants, unary/binary
+ * arithmetic, ?:, integer casts, and sizeof(type). */
+static int fold_const_expr(Parser *P, Node *e, long long *out) {
+  if (!e)
+    return 0;
+  switch (e->kind) {
+  case EX_INT:
+  case EX_CHAR:
+    *out = e->ival;
+    return 1;
+  case EX_IDENT:
+    return e->name ? parser_enum_lookup(P, e->name, out) : 0;
+  case EX_UNARY: {
+    long long v;
+    if (!fold_const_expr(P, e->lhs, &v))
+      return 0;
+    switch (e->op) {
+    case OP_NEG: *out = -v; return 1;
+    case OP_PLUS: *out = v; return 1;
+    case OP_BITNOT: *out = ~v; return 1;
+    case OP_NOT: *out = !v; return 1;
+    default: return 0;
+    }
+  }
+  case EX_BINARY: {
+    long long a, b;
+    if (!fold_const_expr(P, e->lhs, &a) || !fold_const_expr(P, e->rhs, &b))
+      return 0;
+    switch (e->op) {
+    case OP_ADD: *out = a + b; return 1;
+    case OP_SUB: *out = a - b; return 1;
+    case OP_MUL: *out = a * b; return 1;
+    case OP_DIV: *out = b ? a / b : 0; return b != 0;
+    case OP_MOD: *out = b ? a % b : 0; return b != 0;
+    case OP_EQ: *out = a == b; return 1;
+    case OP_NE: *out = a != b; return 1;
+    case OP_LT: *out = a < b; return 1;
+    case OP_LE: *out = a <= b; return 1;
+    case OP_GT: *out = a > b; return 1;
+    case OP_GE: *out = a >= b; return 1;
+    case OP_AND: *out = a && b; return 1;
+    case OP_OR: *out = a || b; return 1;
+    case OP_BITAND: *out = a & b; return 1;
+    case OP_BITOR: *out = a | b; return 1;
+    case OP_BITXOR: *out = a ^ b; return 1;
+    case OP_LSHIFT: *out = a << (b & 63); return 1;
+    case OP_RSHIFT: *out = a >> (b & 63); return 1;
+    default: return 0;
+    }
+  }
+  case EX_COND: {
+    long long c;
+    if (!fold_const_expr(P, e->cond, &c))
+      return 0;
+    return fold_const_expr(P, c ? e->lhs : e->rhs, out);
+  }
+  case EX_CAST: {
+    long long v;
+    if (!fold_const_expr(P, e->lhs, &v))
+      return 0;
+    Type *t = e->decl_type;
+    if (t && type_is_integer(t) && t->size > 0 && t->size < 8) {
+      unsigned shift = (unsigned)(64 - 8 * t->size);
+      if (type_is_unsigned(t))
+        v = (long long)(((unsigned long long)v << shift) >> shift);
+      else
+        v = (v << shift) >> shift;
+    }
+    *out = v;
+    return 1;
+  }
+  case EX_SIZEOF_TYPE:
+    if (e->decl_type && !e->decl_type->is_incomplete && e->decl_type->size) {
+      *out = (long long)e->decl_type->size;
+      return 1;
+    }
+    return 0;
+  default:
+    return 0;
+  }
 }
 
 /* Integer constant-expression subset for enumerators (C99 6.6). */
@@ -477,10 +602,10 @@ static long long parse_const_primary(Parser *P) {
     return v;
   }
   if (check(P, TK_IDENT)) {
-    /* enumerator ref: look up later enumerators not yet visible; 0 if unknown */
-    /* Best-effort: leave 0 — prior enumerators registered only after finish. */
+    long long v = 0;
+    parser_enum_lookup(P, P->tok.text, &v); /* 0 if unknown */
     next(P);
-    return 0;
+    return v;
   }
   diag_error(P->diag, P->tok.loc, "expected integer constant expression");
   next(P);
@@ -584,6 +709,7 @@ static Type *parse_enum(Parser *P) {
       m.type = et;
       m.offset = (size_t)(uint64_t)val; /* store value in offset */
       buf_push(et->members, m);
+      parser_enum_register(P, id.text, val);
       val++;
       if (!match(P, TK_COMMA))
         break;
@@ -693,15 +819,18 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
       continue;
     }
     if (check(P, TK_IDENT) && lexer_is_typedef(P->lexer, P->tok.text)) {
-      /* typedef name */
-      /* For simplicity, treat as int if we don't track typedef types fully —
-       * parser registers typedef names; sema resolves. Store name in tag. */
-      Type *t = (Type *)arena_calloc(P->arena, sizeof(Type));
-      t->kind = TY_INT; /* placeholder; name in tag for sema */
-      t->tag = P->tok.text;
-      t->size = 4;
-      t->align = 4;
-      t->enum_value = 1; /* flag: typedef name ref */
+      /* typedef name: resolve from the parser's table so member layout and
+       * nested member access see the real type at parse time. */
+      Type *t = parser_typedef_lookup(P, P->tok.text);
+      if (!t) {
+        /* placeholder; name in tag for sema fallback */
+        t = (Type *)arena_calloc(P->arena, sizeof(Type));
+        t->kind = TY_INT;
+        t->tag = P->tok.text;
+        t->size = 4;
+        t->align = 4;
+        t->enum_value = 1; /* flag: typedef name ref */
+      }
       next(P);
       *saw_type = 1;
       struct_ty = t;
@@ -896,13 +1025,18 @@ static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
     } else if (match(P, TK_LBRACKET)) {
       size_t len = 0;
       int is_vla = 0;
-      if (check(P, TK_INT)) {
-        len = (size_t)P->tok.ival;
+      /* C99 array declarator extras: [static n], [const n], [*] */
+      while (check(P, TK_STATIC) || check(P, TK_CONST) ||
+             check(P, TK_VOLATILE) || check(P, TK_RESTRICT))
         next(P);
+      if (check(P, TK_STAR) && lookahead(P).kind == TK_RBRACKET) {
+        next(P); /* [*] — VLA of unspecified size (prototype only) */
+        is_vla = 1;
       } else if (!check(P, TK_RBRACKET)) {
         Node *bound = parse_assign(P);
-        if (bound && bound->kind == EX_INT)
-          len = (size_t)bound->ival;
+        long long cval = 0;
+        if (fold_const_expr(P, bound, &cval) && cval >= 0)
+          len = (size_t)cval;
         else {
           is_vla = 1;
           len = 0;
@@ -1259,8 +1393,10 @@ static Node *parse_decl_or_stmt(Parser *P) {
     Node *d;
     if (sc == SC_TYPEDEF) {
       d = node_new(P->arena, D_TYPEDEF, P->tok.loc);
-      if (name)
+      if (name) {
         lexer_add_typedef(P->lexer, name);
+        parser_typedef_register(P, name, ty);
+      }
     } else if (ty->kind == TY_FUNC) {
       d = node_new(P->arena, D_FUNC, P->tok.loc);
       d->params = params;
@@ -1348,8 +1484,10 @@ Program *parse_program(Parser *P) {
       Node *d;
       if (sc == SC_TYPEDEF) {
         d = node_new(P->arena, D_TYPEDEF, P->tok.loc);
-        if (name)
+        if (name) {
           lexer_add_typedef(P->lexer, name);
+          parser_typedef_register(P, name, ty);
+        }
       } else if (ty->kind == TY_FUNC) {
         d = node_new(P->arena, D_FUNC, P->tok.loc);
         d->params = params;

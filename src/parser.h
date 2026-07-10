@@ -12,6 +12,13 @@ typedef struct {
   Token tok;
   Token peek;
   int has_peek;
+  /* enumerator table for parse-time constant expressions (stretchy) */
+  const char **enum_names;
+  long long *enum_vals;
+  /* typedef name -> type table so member/declarator types resolve at parse
+   * time (layout needs real sizes) (stretchy) */
+  const char **typedef_names;
+  Type **typedef_types;
 } Parser;
 
 void parser_init(Parser *P, Lexer *lexer, TypeContext *tc);
