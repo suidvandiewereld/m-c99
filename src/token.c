@@ -90,6 +90,7 @@ const char *token_kind_name(TokenKind k) {
   case TK_WHILE: return "'while'";
   case TK_BOOL: return "'_Bool'";
   case TK_COMPLEX: return "'_Complex'";
+  case TK_INT128: return "'__int128'";
   }
   return "token";
 }

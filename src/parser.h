@@ -22,6 +22,9 @@ typedef struct {
 } Parser;
 
 void parser_init(Parser *P, Lexer *lexer, TypeContext *tc);
+
+/* set when any TU mentions __int128 (driver appends the u128 runtime TU) */
+extern int c99m_saw_int128;
 Program *parse_program(Parser *P);
 
 #endif /* C99M_PARSER_H */

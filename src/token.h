@@ -100,6 +100,7 @@ typedef enum {
   TK_WHILE,
   TK_BOOL,      /* _Bool */
   TK_COMPLEX,   /* _Complex (accepted, limited) */
+  TK_INT128,    /* __int128 (lowered to a two-u64 struct) */
 } TokenKind;
 
 typedef struct Token {

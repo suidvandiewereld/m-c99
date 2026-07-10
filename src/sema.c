@@ -177,6 +177,90 @@ static Type *apply_conv(Sema *S, Node *e, Type *to) {
   return to;
 }
 
+/* ---- __int128 desugar: two-u64 struct + __c99m_u128_* helper calls ---- */
+
+static int is_u128(Type *t) {
+  return t && (t->kind == TY_STRUCT) && t->tag &&
+         strcmp(t->tag, "__c99m_u128") == 0;
+}
+
+static Node *u128_shallow_clone(Sema *S, Node *e) {
+  Node *c = node_new(S->arena, e->kind, e->loc);
+  *c = *e;
+  return c;
+}
+
+/* wrap an integer expression as __c99m_u128_from_u64((unsigned long long)e) */
+static Node *u128_wrap(Sema *S, Node *e) {
+  Node *cast = node_new(S->arena, EX_CAST, e->loc);
+  cast->decl_type = S->tc->ty_ullong;
+  cast->lhs = e;
+  Node *fnid = node_new(S->arena, EX_IDENT, e->loc);
+  fnid->name = "__c99m_u128_from_u64";
+  Node *call = node_new(S->arena, EX_CALL, e->loc);
+  call->lhs = fnid;
+  buf_push(call->stmts, cast);
+  return call;
+}
+
+/* Mutate `e` in place into `fn(a[, b])` and re-check it. */
+static Type *u128_rewrite_call(Sema *S, Node *e, const char *fn, Node *a,
+                               Node *b) {
+  Node *fnid = node_new(S->arena, EX_IDENT, e->loc);
+  fnid->name = fn;
+  e->kind = EX_CALL;
+  e->lhs = fnid;
+  e->rhs = NULL;
+  e->cond = NULL;
+  e->stmts = NULL;
+  buf_push(e->stmts, a);
+  if (b)
+    buf_push(e->stmts, b);
+  e->type = NULL;
+  return check_expr(S, e);
+}
+
+static Type *u128_rewrite_binary(Sema *S, Node *e, Type *lt, Type *rt) {
+  const char *fn = NULL;
+  int is_shift = 0;
+  switch (e->op) {
+  case OP_ADD: fn = "__c99m_u128_add"; break;
+  case OP_SUB: fn = "__c99m_u128_sub"; break;
+  case OP_MUL: fn = "__c99m_u128_mul"; break;
+  case OP_DIV: fn = "__c99m_u128_div"; break;
+  case OP_MOD: fn = "__c99m_u128_mod"; break;
+  case OP_BITAND: fn = "__c99m_u128_and"; break;
+  case OP_BITOR: fn = "__c99m_u128_or"; break;
+  case OP_BITXOR: fn = "__c99m_u128_xor"; break;
+  case OP_LSHIFT: fn = "__c99m_u128_shl"; is_shift = 1; break;
+  case OP_RSHIFT: fn = "__c99m_u128_shr"; is_shift = 1; break;
+  case OP_LT: fn = "__c99m_u128_lt"; break;
+  case OP_LE: fn = "__c99m_u128_le"; break;
+  case OP_GT: fn = "__c99m_u128_gt"; break;
+  case OP_GE: fn = "__c99m_u128_ge"; break;
+  case OP_EQ: fn = "__c99m_u128_eq"; break;
+  case OP_NE: fn = "__c99m_u128_ne"; break;
+  default:
+    diag_error(S->diag, e->loc, "unsupported operator on __int128");
+    e->type = S->tc->ty_int;
+    return e->type;
+  }
+  Node *a = e->lhs;
+  Node *b = e->rhs;
+  if (!is_u128(lt))
+    a = u128_wrap(S, a);
+  if (!is_shift && !is_u128(rt))
+    b = u128_wrap(S, b);
+  if (is_shift && is_u128(rt)) {
+    /* shift count as int via lo word */
+    Node *lo = node_new(S->arena, EX_MEMBER, b->loc);
+    lo->lhs = b;
+    lo->name = "lo";
+    b = lo;
+  }
+  return u128_rewrite_call(S, e, fn, a, b);
+}
+
 static Type *check_binary(Sema *S, Node *e) {
   Type *lt = check_expr(S, e->lhs);
   Type *rt = check_expr(S, e->rhs);
@@ -184,6 +268,9 @@ static Type *check_binary(Sema *S, Node *e) {
   rt = type_decay(S->tc, rt);
   e->lhs->type = lt;
   e->rhs->type = rt;
+
+  if (is_u128(lt) || is_u128(rt))
+    return u128_rewrite_binary(S, e, lt, rt);
 
   switch (e->op) {
   case OP_ADD:
@@ -295,6 +382,8 @@ static Type *check_expr(Sema *S, Node *e) {
     (void)lt0;
     (void)rt0;
     Type *r = check_binary(S, e);
+    if (e->kind != EX_BINARY)
+      return r; /* rewritten (e.g. __int128 helper call) */
     /* complex arithmetic: promote if either side complex */
     Type *lt = e->lhs->type, *rt = e->rhs->type;
     if ((lt && lt->kind == TY_COMPLEX) || (rt && rt->kind == TY_COMPLEX)) {
@@ -324,11 +413,34 @@ static Type *check_expr(Sema *S, Node *e) {
     case OP_NOT:
       e->type = S->tc->ty_int;
       return e->type;
+    case OP_PREINC:
+    case OP_PREDEC:
+      if (is_u128(t)) {
+        Node *b = node_new(S->arena, EX_BINARY, e->loc);
+        b->op = (e->op == OP_PREINC) ? OP_ADD : OP_SUB;
+        b->lhs = u128_shallow_clone(S, e->lhs);
+        Node *one = node_new(S->arena, EX_INT, e->loc);
+        one->ival = 1;
+        b->rhs = one;
+        e->kind = EX_ASSIGN;
+        e->op = OP_ASSIGN;
+        e->rhs = b;
+        return check_expr(S, e);
+      }
+      e->type = type_promote(S->tc, t);
+      return e->type;
     case OP_NEG:
     case OP_PLUS:
     case OP_BITNOT:
-    case OP_PREINC:
-    case OP_PREDEC:
+      if (is_u128(t)) {
+        if (e->op == OP_PLUS) {
+          *e = *e->lhs; /* +x is x */
+          return check_expr(S, e);
+        }
+        const char *ufn =
+            (e->op == OP_NEG) ? "__c99m_u128_neg" : "__c99m_u128_not";
+        return u128_rewrite_call(S, e, ufn, e->lhs, NULL);
+      }
       e->type = type_promote(S->tc, t);
       return e->type;
     case OP_ADDR:
@@ -356,6 +468,19 @@ static Type *check_expr(Sema *S, Node *e) {
   }
   case EX_POSTFIX: {
     Type *t = check_expr(S, e->lhs);
+    if (is_u128(t)) {
+      /* x++ / x-- as x = x +- 1 (statement-position semantics) */
+      Node *b = node_new(S->arena, EX_BINARY, e->loc);
+      b->op = (e->op == OP_POSTINC) ? OP_ADD : OP_SUB;
+      b->lhs = u128_shallow_clone(S, e->lhs);
+      Node *one = node_new(S->arena, EX_INT, e->loc);
+      one->ival = 1;
+      b->rhs = one;
+      e->kind = EX_ASSIGN;
+      e->op = OP_ASSIGN;
+      e->rhs = b;
+      return check_expr(S, e);
+    }
     e->type = type_promote(S->tc, type_decay(S->tc, t));
     return e->type;
   }
@@ -364,6 +489,30 @@ static Type *check_expr(Sema *S, Node *e) {
     Type *rt = type_decay(S->tc, check_expr(S, e->rhs));
     if (!is_lvalue(e->lhs))
       diag_error(S->diag, e->loc, "lvalue required as left operand of assignment");
+    /* compound assignment on __int128: a op= b  ->  a = helper(a, b) */
+    if (e->op != OP_ASSIGN && (is_u128(lt) || is_u128(rt))) {
+      OpKind bin;
+      switch (e->op) {
+      case OP_ADD_A: bin = OP_ADD; break;
+      case OP_SUB_A: bin = OP_SUB; break;
+      case OP_MUL_A: bin = OP_MUL; break;
+      case OP_DIV_A: bin = OP_DIV; break;
+      case OP_MOD_A: bin = OP_MOD; break;
+      case OP_AND_A: bin = OP_BITAND; break;
+      case OP_OR_A: bin = OP_BITOR; break;
+      case OP_XOR_A: bin = OP_BITXOR; break;
+      case OP_SHL_A: bin = OP_LSHIFT; break;
+      case OP_SHR_A: bin = OP_RSHIFT; break;
+      default: bin = OP_ADD; break;
+      }
+      Node *b = node_new(S->arena, EX_BINARY, e->loc);
+      b->op = bin;
+      b->lhs = u128_shallow_clone(S, e->lhs);
+      b->rhs = e->rhs;
+      e->op = OP_ASSIGN;
+      e->rhs = b;
+      check_expr(S, e->rhs);
+    }
     e->type = lt;
     (void)rt;
     (void)apply_conv;
@@ -470,7 +619,31 @@ static Type *check_expr(Sema *S, Node *e) {
   }
   case EX_CAST: {
     e->decl_type = resolve_type(S, e->decl_type);
-    check_expr(S, e->lhs);
+    Type *it = check_expr(S, e->lhs);
+    it = type_decay(S->tc, it);
+    if (is_u128(e->decl_type) && !is_u128(it)) {
+      /* (u128)x -> __c99m_u128_from_u64((unsigned long long)x) */
+      Node *inner = e->lhs;
+      Node *cast = node_new(S->arena, EX_CAST, e->loc);
+      cast->decl_type = S->tc->ty_ullong;
+      cast->lhs = inner;
+      return u128_rewrite_call(S, e, "__c99m_u128_from_u64", cast, NULL);
+    }
+    if (!is_u128(e->decl_type) && is_u128(it) &&
+        type_is_integer(e->decl_type)) {
+      /* (integer)u128 -> (integer)__c99m_u128_to_u64(x) */
+      Type *target = e->decl_type;
+      Node *inner = e->lhs;
+      u128_rewrite_call(S, e, "__c99m_u128_to_u64", inner, NULL);
+      Node *callcopy = u128_shallow_clone(S, e);
+      e->kind = EX_CAST;
+      e->decl_type = target;
+      e->lhs = callcopy;
+      e->rhs = NULL;
+      e->stmts = NULL;
+      e->type = target;
+      return e->type;
+    }
     e->type = e->decl_type;
     return e->type;
   }

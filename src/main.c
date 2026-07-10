@@ -28,6 +28,106 @@ static void usage(const char *argv0) {
 }
 
 /* Parse with stable lexer storage on arena. */
+
+/* ---- __int128 runtime: unsigned 128-bit ops over a two-u64 struct.
+ * Appended as an extra TU whenever any input mentions __int128; sema
+ * rewrites u128 operators into these calls. Shift-subtract division. ---- */
+static const char *c99m_u128_runtime_src =
+    "typedef struct __c99m_u128 { unsigned long long lo; unsigned long long hi; } __c99m_u128;\n"
+    "__c99m_u128 __c99m_u128_from_u64(unsigned long long x) {\n"
+    "  __c99m_u128 r; r.lo = x; r.hi = 0; return r;\n"
+    "}\n"
+    "unsigned long long __c99m_u128_to_u64(__c99m_u128 a) { return a.lo; }\n"
+    "__c99m_u128 __c99m_u128_add(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo + b.lo;\n"
+    "  r.hi = a.hi + b.hi + (r.lo < a.lo ? 1ULL : 0ULL); return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_sub(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo - b.lo;\n"
+    "  r.hi = a.hi - b.hi - (a.lo < b.lo ? 1ULL : 0ULL); return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_neg(__c99m_u128 a) {\n"
+    "  __c99m_u128 z; z.lo = 0; z.hi = 0; return __c99m_u128_sub(z, a);\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_not(__c99m_u128 a) {\n"
+    "  __c99m_u128 r; r.lo = ~a.lo; r.hi = ~a.hi; return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_and(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo & b.lo; r.hi = a.hi & b.hi; return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_or(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo | b.lo; r.hi = a.hi | b.hi; return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_xor(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo ^ b.lo; r.hi = a.hi ^ b.hi; return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_shl(__c99m_u128 a, int k) {\n"
+    "  __c99m_u128 r; k = k & 127;\n"
+    "  if (k == 0) return a;\n"
+    "  if (k >= 64) { r.hi = a.lo << (k - 64); r.lo = 0; return r; }\n"
+    "  r.hi = (a.hi << k) | (a.lo >> (64 - k));\n"
+    "  r.lo = a.lo << k; return r;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_shr(__c99m_u128 a, int k) {\n"
+    "  __c99m_u128 r; k = k & 127;\n"
+    "  if (k == 0) return a;\n"
+    "  if (k >= 64) { r.lo = a.hi >> (k - 64); r.hi = 0; return r; }\n"
+    "  r.lo = (a.lo >> k) | (a.hi << (64 - k));\n"
+    "  r.hi = a.hi >> k; return r;\n"
+    "}\n"
+    "static unsigned long long __c99m_umulhi64(unsigned long long a, unsigned long long b) {\n"
+    "  unsigned long long a0 = a & 0xffffffffULL; unsigned long long a1 = a >> 32;\n"
+    "  unsigned long long b0 = b & 0xffffffffULL; unsigned long long b1 = b >> 32;\n"
+    "  unsigned long long t = a0 * b0;\n"
+    "  unsigned long long k = t >> 32;\n"
+    "  unsigned long long w1;\n"
+    "  unsigned long long w2;\n"
+    "  t = a1 * b0 + k; w1 = t & 0xffffffffULL; w2 = t >> 32;\n"
+    "  t = a0 * b1 + w1; k = t >> 32;\n"
+    "  return a1 * b1 + w2 + k;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_mul(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; r.lo = a.lo * b.lo;\n"
+    "  r.hi = __c99m_umulhi64(a.lo, b.lo) + a.lo * b.hi + a.hi * b.lo;\n"
+    "  return r;\n"
+    "}\n"
+    "int __c99m_u128_lt(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  if (a.hi != b.hi) return a.hi < b.hi ? 1 : 0;\n"
+    "  return a.lo < b.lo ? 1 : 0;\n"
+    "}\n"
+    "int __c99m_u128_eq(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  return (a.lo == b.lo && a.hi == b.hi) ? 1 : 0;\n"
+    "}\n"
+    "int __c99m_u128_ne(__c99m_u128 a, __c99m_u128 b) { return !__c99m_u128_eq(a, b); }\n"
+    "int __c99m_u128_gt(__c99m_u128 a, __c99m_u128 b) { return __c99m_u128_lt(b, a); }\n"
+    "int __c99m_u128_le(__c99m_u128 a, __c99m_u128 b) { return !__c99m_u128_lt(b, a); }\n"
+    "int __c99m_u128_ge(__c99m_u128 a, __c99m_u128 b) { return !__c99m_u128_lt(a, b); }\n"
+    "__c99m_u128 __c99m_u128_divmod(__c99m_u128 n, __c99m_u128 d, __c99m_u128 *rem) {\n"
+    "  __c99m_u128 q; __c99m_u128 r; int i;\n"
+    "  q.lo = 0; q.hi = 0; r.lo = 0; r.hi = 0;\n"
+    "  if (d.lo == 0 && d.hi == 0) { if (rem) *rem = r; return q; }\n"
+    "  for (i = 127; i >= 0; i--) {\n"
+    "    unsigned long long bit;\n"
+    "    if (i >= 64) bit = (n.hi >> (i - 64)) & 1ULL; else bit = (n.lo >> i) & 1ULL;\n"
+    "    r.hi = (r.hi << 1) | (r.lo >> 63);\n"
+    "    r.lo = (r.lo << 1) | bit;\n"
+    "    if (r.hi > d.hi || (r.hi == d.hi && r.lo >= d.lo)) {\n"
+    "      unsigned long long borrow = (r.lo < d.lo) ? 1ULL : 0ULL;\n"
+    "      r.lo = r.lo - d.lo;\n"
+    "      r.hi = r.hi - d.hi - borrow;\n"
+    "      if (i >= 64) q.hi = q.hi | (1ULL << (i - 64)); else q.lo = q.lo | (1ULL << i);\n"
+    "    }\n"
+    "  }\n"
+    "  if (rem) *rem = r;\n"
+    "  return q;\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_div(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  return __c99m_u128_divmod(a, b, (__c99m_u128 *)0);\n"
+    "}\n"
+    "__c99m_u128 __c99m_u128_mod(__c99m_u128 a, __c99m_u128 b) {\n"
+    "  __c99m_u128 r; __c99m_u128_divmod(a, b, &r); return r;\n"
+    "}\n";
+
 static Program *compile_tu_stable(Arena *arena, Diag *diag, TypeContext *tc,
                                   PreprocessOptions *ppopt, const char *path) {
   size_t plen = 0;
@@ -291,6 +391,39 @@ int main(int argc, char **argv) {
         decl->name = mangled;
       }
       buf_push(merged->decls, decl);
+    }
+  }
+
+  /* Any TU used __int128: append the u128 helper runtime as one more TU. */
+  if (c99m_saw_int128) {
+    size_t rl = strlen(c99m_u128_runtime_src);
+    char *pre = preprocess_source(&ppopt, "<c99m-u128-runtime>",
+                                  c99m_u128_runtime_src, rl, &rl);
+    if (pre) {
+      Lexer *rlex = (Lexer *)arena_calloc(&arena, sizeof(Lexer));
+      lexer_init(rlex, &arena, &diag, "<c99m-u128-runtime>", pre, rl);
+      Parser rp;
+      parser_init(&rp, rlex, &tc);
+      Program *rprog = parse_program(&rp);
+      if (rprog && !diag.error_count) {
+        for (size_t d = 0; d < buf_len(rprog->decls); d++) {
+          Node *decl = rprog->decls[d];
+          decl->tu_id = (int)buf_len(inputs);
+          if (decl->storage == SC_STATIC && decl->name &&
+              (decl->kind == D_VAR || decl->kind == D_FUNC)) {
+            const char *old_name = decl->name;
+            char *mangled =
+                arena_sprintf(&arena, "__stU_%s", old_name);
+            for (size_t j = 0; j < buf_len(rprog->decls); j++) {
+              Node *fn = rprog->decls[j];
+              if (fn->kind == D_FUNC && fn->is_definition)
+                rename_static_uses(fn->body, old_name, mangled, 0);
+            }
+            decl->name = mangled;
+          }
+          buf_push(merged->decls, decl);
+        }
+      }
     }
   }
 

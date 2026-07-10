@@ -50,6 +50,7 @@ void parser_init(Parser *P, Lexer *lexer, TypeContext *tc) {
 static Node *parse_expr(Parser *P);
 static Node *parse_assign(Parser *P);
 static Node *parse_cond(Parser *P);
+static Node *parse_unary(Parser *P);
 static Node *parse_stmt(Parser *P);
 static Node *parse_compound(Parser *P);
 static Type *parse_type_name(Parser *P);
@@ -112,8 +113,10 @@ static Node *parse_primary(Parser *P) {
         n->init = parse_initializer(P);
         return n;
       }
-      Node *inner = parse_cond(P); /* cast has same precedence as unary */
-      /* but cast is unary — we need full unary of rest. re-parse as cast of unary */
+      /* C99 6.5.4: the operand of a cast is a cast-expression (unary),
+       * not a full conditional — `(T)a < b` is `((T)a) < b`. Nested casts
+       * arrive here recursively through parse_primary's '(' handling. */
+      Node *inner = parse_unary(P);
       Node *n = node_new(P->arena, EX_CAST, t.loc);
       n->decl_type = ty;
       n->lhs = inner;
@@ -395,6 +398,7 @@ static int is_type_token(Parser *P) {
   case TK_VOLATILE:
   case TK_RESTRICT:
   case TK_COMPLEX:
+  case TK_INT128:
     return 1;
   case TK_IDENT:
     return lexer_is_typedef(P->lexer, P->tok.text);
@@ -480,6 +484,26 @@ static char *parse_asm_label(Parser *P) {
     return label;
   }
   return NULL;
+}
+
+/* set when any TU mentions __int128 so the driver appends the u128 runtime */
+int c99m_saw_int128 = 0;
+
+/* `unsigned __int128` is desugared to this two-u64 struct; sema rewrites its
+ * operators into __c99m_u128_* helper calls (see the builtin runtime TU). */
+static Type *parser_u128_type(Parser *P) {
+  Type *st = type_tag_lookup(P->tc, "__c99m_u128", 0);
+  if (st && st->kind == TY_STRUCT && !st->is_incomplete)
+    return st;
+  if (!st || st->kind != TY_STRUCT) {
+    st = type_struct_create(P->tc, "__c99m_u128", 0);
+    type_tag_register(P->tc, st);
+  }
+  st->members = NULL;
+  type_struct_add_member(P->tc, st, "lo", P->tc->ty_ullong);
+  type_struct_add_member(P->tc, st, "hi", P->tc->ty_ullong);
+  type_struct_finish(st);
+  return st;
 }
 
 /* ---- parse-time typedef table ---- */
@@ -848,6 +872,14 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
       *saw_type = 1;
       continue;
     }
+    if (check(P, TK_INT128)) {
+      next(P);
+      c99m_saw_int128 = 1;
+      struct_ty = parser_u128_type(P);
+      base = BS_STRUCT;
+      *saw_type = 1;
+      continue;
+    }
     if (check(P, TK_IDENT) && lexer_is_typedef(P->lexer, P->tok.text)) {
       /* typedef name: resolve from the parser's table so member layout and
        * nested member access see the real type at parse time. */
@@ -873,10 +905,15 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
   Type *ty = P->tc->ty_int;
   switch (base) {
   case BS_NONE:
-    if (nshort || nlong || is_signed || is_unsigned)
-      ty = P->tc->ty_int;
+    /* modifier-only declarations: `unsigned long long x`, `short y`, ... */
+    if (nshort)
+      ty = is_unsigned ? P->tc->ty_ushort : P->tc->ty_short;
+    else if (nlong >= 2)
+      ty = is_unsigned ? P->tc->ty_ullong : P->tc->ty_llong;
+    else if (nlong == 1)
+      ty = is_unsigned ? P->tc->ty_ulong : P->tc->ty_long;
     else
-      ty = P->tc->ty_int;
+      ty = is_unsigned ? P->tc->ty_uint : P->tc->ty_int;
     break;
   case BS_VOID:
     ty = P->tc->ty_void;

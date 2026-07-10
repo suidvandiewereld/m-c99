@@ -185,6 +185,7 @@ static TokenKind keyword_kind(const char *s, int len) {
   KW("while", TK_WHILE);
   KW("_Bool", TK_BOOL);
   KW("_Complex", TK_COMPLEX);
+  KW("__int128", TK_INT128);
 #undef KW
   return TK_IDENT;
 }
