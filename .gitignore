@@ -1,5 +1,6 @@
 libmtlc/docs
 bin/
+third_party/
 *.exe
 *.obj
 *.o

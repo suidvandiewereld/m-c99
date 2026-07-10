@@ -1,4 +1,4 @@
-/* C99 <string.h> */
+/* C99 <string.h> — declarations; definitions come from the host CRT at link. */
 #ifndef _STRING_H
 #define _STRING_H
 
@@ -7,13 +7,35 @@
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t n);
+int strcoll(const char *a, const char *b);
+size_t strxfrm(char *d, const char *s, size_t n);
 char *strcpy(char *d, const char *s);
 char *strncpy(char *d, const char *s, size_t n);
+char *strcat(char *d, const char *s);
+char *strncat(char *d, const char *s, size_t n);
 void *memset(void *p, int c, size_t n);
 void *memcpy(void *d, const void *s, size_t n);
 void *memmove(void *d, const void *s, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
+void *memchr(const void *p, int c, size_t n);
 char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
+char *strstr(const char *s, const char *needle);
+char *strpbrk(const char *s, const char *set);
+size_t strspn(const char *s, const char *set);
+size_t strcspn(const char *s, const char *set);
+char *strtok(char *s, const char *delim);
+char *strerror(int errnum);
+
+/* Windows CRT names for POSIX-ish extras */
+char *_strdup(const char *s);
+#define strdup _strdup
+int _stricmp(const char *a, const char *b);
+#define strcasecmp _stricmp
+int _strnicmp(const char *a, const char *b, size_t n);
+#define strncasecmp _strnicmp
+char *strtok_s(char *s, const char *delim, char **ctx);
+#define strtok_r strtok_s
 
 #ifdef C99MTLC_STRING_IMPL
 
