@@ -53,6 +53,12 @@ static Symbol *scope_insert(Sema *S, SymKind kind, const char *name, Type *type,
     if (kind == SYM_VAR && exist->kind == SYM_VAR &&
         (exist->is_extern || (decl && decl->storage == SC_EXTERN)))
       return exist;
+    /* enum constants re-registered from repeated enum-type references and
+     * typedef redeclarations of the same name are harmless */
+    if (kind == SYM_ENUM_CONST && exist->kind == SYM_ENUM_CONST)
+      return exist;
+    if (kind == SYM_TYPEDEF && exist->kind == SYM_TYPEDEF)
+      return exist;
     diag_error(S->diag, decl ? decl->loc : (SrcLoc){0},
                "redefinition of '%s'", name);
     return exist;

@@ -690,12 +690,23 @@ static Type *parse_enum(Parser *P) {
     tag = P->tok.text;
     next(P);
   }
-  Type *et = (Type *)arena_calloc(P->arena, sizeof(Type));
-  et->kind = TY_ENUM;
-  et->tag = tag;
-  et->size = 4;
-  et->align = 4;
+  Type *et = NULL;
+  if (tag) {
+    Type *prev = type_tag_lookup(P->tc, tag, 0);
+    if (prev && prev->kind == TY_ENUM)
+      et = prev;
+  }
+  if (!et) {
+    et = (Type *)arena_calloc(P->arena, sizeof(Type));
+    et->kind = TY_ENUM;
+    et->tag = tag;
+    et->size = 4;
+    et->align = 4;
+    if (tag)
+      type_tag_register(P->tc, et);
+  }
   if (match(P, TK_LBRACE)) {
+    et->members = NULL; /* redefinition in a new TU pass */
     long long val = 0;
     while (!check(P, TK_RBRACE) && !check(P, TK_EOF)) {
       Token id = P->tok;
