@@ -19,7 +19,7 @@ typedef long long SSIZE_T;
 typedef void *PVOID, *LPVOID, *HANDLE, *HMODULE, *HINSTANCE, *HLOCAL,
     *HGLOBAL;
 typedef const void *LPCVOID;
-typedef char CHAR, *PSTR, *LPSTR, *PCHAR;
+typedef char CHAR, TCHAR, *PSTR, *LPSTR, *PCHAR;
 typedef const char *LPCSTR, *PCSTR;
 typedef WCHAR *LPWSTR, *PWSTR;
 typedef const WCHAR *LPCWSTR, *PCWSTR;
