@@ -155,7 +155,6 @@ DWORD GetCurrentThreadId(void);
 BOOL IsDebuggerPresent(void);
 void DebugBreak(void);
 void OutputDebugStringA(LPCSTR s);
-DWORD GetCommandLineA_len(void); /* not a real API; do not use */
 LPSTR GetCommandLineA(void);
 
 /* ---- timing ---- */
@@ -168,14 +167,35 @@ void GetSystemTimeAsFileTime(FILETIME *out);
 void GetLocalTime(SYSTEMTIME *out);
 void GetSystemTime(SYSTEMTIME *out);
 
-/* ---- interlocked (kernel32 exports on x64) ---- */
-LONG InterlockedIncrement(LONG volatile *p);
-LONG InterlockedDecrement(LONG volatile *p);
-LONG InterlockedExchange(LONG volatile *p, LONG v);
-LONG InterlockedExchangeAdd(LONG volatile *p, LONG v);
-LONG InterlockedCompareExchange(LONG volatile *p, LONG nv, LONG cmp);
-LONGLONG InterlockedCompareExchange64(LONGLONG volatile *p, LONGLONG nv,
-                                      LONGLONG cmp);
+/* ---- interlocked ----
+ * On x64 these are compiler intrinsics, not kernel32 exports, so the PE
+ * import prober cannot resolve them. Plain load/store stand-ins: not atomic,
+ * fine for the compiler driver's one-shot guards and refcounts. */
+static LONG InterlockedIncrement(LONG volatile *p) { return ++(*p); }
+static LONG InterlockedDecrement(LONG volatile *p) { return --(*p); }
+static LONG InterlockedExchange(LONG volatile *p, LONG v) {
+  LONG old = *p;
+  *p = v;
+  return old;
+}
+static LONG InterlockedExchangeAdd(LONG volatile *p, LONG v) {
+  LONG old = *p;
+  *p = old + v;
+  return old;
+}
+static LONG InterlockedCompareExchange(LONG volatile *p, LONG nv, LONG cmp) {
+  LONG old = *p;
+  if (old == cmp)
+    *p = nv;
+  return old;
+}
+static LONGLONG InterlockedCompareExchange64(LONGLONG volatile *p, LONGLONG nv,
+                                             LONGLONG cmp) {
+  LONGLONG old = *p;
+  if (old == cmp)
+    *p = nv;
+  return old;
+}
 
 /* ---- synchronization ---- */
 typedef struct _CRITICAL_SECTION {

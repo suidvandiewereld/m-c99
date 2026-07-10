@@ -70,16 +70,18 @@ float log2f(float x);
 float powf(float x, float y);
 float sqrtf(float x);
 float ceilf(float x);
-float fabsf(float x);
 float floorf(float x);
 float fmodf(float x, float y);
 float roundf(float x);
 float truncf(float x);
 float fminf(float x, float y);
 float fmaxf(float x, float y);
-float ldexpf(float x, int e);
-float frexpf(float x, int *e);
 float modff(float x, float *ip);
+
+/* not exported by msvcrt/ucrtbase on x64 (compiler intrinsics there) */
+static float fabsf(float x) { return (float)fabs((double)x); }
+static float ldexpf(float x, int e) { return (float)ldexp((double)x, e); }
+static float frexpf(float x, int *e) { return (float)frexp((double)x, e); }
 
 int _isnan(double x);
 int _finite(double x);

@@ -34,14 +34,30 @@ int getchar(void);
 int puts(const char *s);
 int printf(const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
-int snprintf(char *buf, size_t n, const char *fmt, ...);
 int fprintf(FILE *f, const char *fmt, ...);
 int vprintf(const char *fmt, va_list ap);
 int vfprintf(FILE *f, const char *fmt, va_list ap);
 int vsprintf(char *buf, const char *fmt, va_list ap);
-int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int _vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int _snprintf(char *buf, size_t n, const char *fmt, ...);
+
+/* C99 snprintf/vsnprintf: not exported by msvcrt/ucrtbase by name (the UCRT
+ * inlines them), so build them here on ucrtbase's exported worker. Option 2 =
+ * standard C99 snprintf behavior (NUL-terminate, return needed length). */
+long long __stdio_common_vsprintf(unsigned long long options, char *buf,
+                                  size_t n, const char *fmt, void *locale,
+                                  va_list ap);
+static int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
+  return (int)__stdio_common_vsprintf(2ULL, buf, n, fmt, (void *)0, ap);
+}
+static int snprintf(char *buf, size_t n, const char *fmt, ...) {
+  va_list ap;
+  int r;
+  va_start(ap, fmt);
+  r = (int)__stdio_common_vsprintf(2ULL, buf, n, fmt, (void *)0, ap);
+  va_end(ap);
+  return r;
+}
 int scanf(const char *fmt, ...);
 int sscanf(const char *s, const char *fmt, ...);
 int fscanf(FILE *f, const char *fmt, ...);
