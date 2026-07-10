@@ -242,6 +242,7 @@ int main(int argc, char **argv) {
   const char *output = NULL;
   int opt_level = 1;
   int obj_only = 0;
+  const char *static_prefix = "st";
   int emit_ir_only = 0;
   int preprocess_only = 0;
   char **inputs = NULL;
@@ -270,6 +271,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "-E") == 0) {
       preprocess_only = 1;
+      continue;
+    }
+    if (strncmp(argv[i], "--static-prefix=", 16) == 0) {
+      static_prefix = argv[i] + 16;
       continue;
     }
     if (strcmp(argv[i], "-O0") == 0) {
@@ -370,7 +375,8 @@ int main(int argc, char **argv) {
       if (decl->storage == SC_STATIC && decl->name &&
           (decl->kind == D_VAR || decl->kind == D_FUNC)) {
         const char *old = decl->name;
-        char *mangled = arena_sprintf(&arena, "__st%zu_%s", i, old);
+        char *mangled =
+            arena_sprintf(&arena, "__%s%zu_%s", static_prefix, i, old);
         for (size_t j = 0; j < buf_len(prog->decls); j++) {
           Node *fn = prog->decls[j];
           if (fn->kind == D_VAR && fn->init && fn != decl) {
