@@ -55,6 +55,9 @@ typedef struct {
   int need_global_init_call;
   /* extern functions already declared to the builder (stretchy) */
   const char **declared_externs;
+  /* string ptr-globals already lazily-init-checked in the CURRENT function
+   * (stretchy; reset per function) */
+  const char **fn_str_ensured;
 } Lower;
 
 /* All calls to an extern variadic pad the tail to this arity so every call
@@ -523,55 +526,70 @@ static int is_addr_global(Symbol *sym) {
  * Result: static duration, one malloc per unique string, no per-access fill.
  */
 static MtlcValue gen_string(Lower *L, const char *data, size_t len) {
-  for (size_t i = 0; i < buf_len(L->str_names); i++) {
-    if (L->str_lens[i] == len && memcmp(L->str_contents[i], data, len) == 0)
-      return mtlc_global_ref(L->fn, L->str_names[i]);
-  }
-  int id = L->str_id++;
-  char *base = arena_sprintf(L->arena, ".str%d", id);
-  size_t total = len + 1;
-  size_t words = (total + 7) / 8;
   const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
   const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_INT8);
   const MtlcType *i8p = mtlc_type_pointer(i8);
 
-  for (size_t w = 0; w < words; w++) {
-    unsigned long long pack = 0;
-    for (size_t b = 0; b < 8; b++) {
-      size_t idx = w * 8 + b;
-      unsigned char ch =
-          (idx < total) ? (idx < len ? (unsigned char)data[idx] : 0) : 0;
-      pack |= ((unsigned long long)ch) << (8 * b);
+  char *ptrname = NULL;
+  for (size_t i = 0; i < buf_len(L->str_names); i++) {
+    if (L->str_lens[i] == len && memcmp(L->str_contents[i], data, len) == 0) {
+      ptrname = L->str_names[i];
+      break;
     }
-    char *wn = arena_sprintf(L->arena, "%s_%zu", base, w);
-    mtlc_builder_global(L->builder, wn, u64, (long long)pack, 0);
   }
-  char *ptrname = arena_sprintf(L->arena, "%s_p", base);
-  mtlc_builder_global(L->builder, ptrname, i8p, 0, 0);
+  if (!ptrname) {
+    int id = L->str_id++;
+    char *base = arena_sprintf(L->arena, ".str%d", id);
+    size_t total = len + 1;
+    size_t words = (total + 7) / 8;
+    for (size_t w = 0; w < words; w++) {
+      unsigned long long pack = 0;
+      for (size_t b = 0; b < 8; b++) {
+        size_t idx = w * 8 + b;
+        unsigned char ch =
+            (idx < total) ? (idx < len ? (unsigned char)data[idx] : 0) : 0;
+        pack |= ((unsigned long long)ch) << (8 * b);
+      }
+      char *wn = arena_sprintf(L->arena, "%s_%zu", base, w);
+      mtlc_builder_global(L->builder, wn, u64, (long long)pack, 0);
+    }
+    ptrname = arena_sprintf(L->arena, "%s_p", base);
+    mtlc_builder_global(L->builder, ptrname, i8p, 0, 0);
+    buf_push(L->str_names, ptrname);
+    buf_push(L->str_contents, arena_strndup(L->arena, data, len));
+    buf_push(L->str_lens, len);
+  }
 
-  MtlcValue g = mtlc_global_ref(L->fn, ptrname);
-  char *done = fresh_label(L, "sd");
-  char *need = fresh_label(L, "si");
-  mtlc_branch_if_zero(L->fn, g, need);
-  mtlc_jump(L->fn, done);
-  mtlc_label(L->fn, need);
-  {
-    /* Materialize once into permanent heap; bytes come from compile-time
-     * constants (data globals above document payload / aid tooling dumps). */
-    MtlcValue mem = heap_bytes(L, total, MTLC_NO_VALUE);
-    for (size_t i = 0; i < total; i++) {
-      unsigned char ch = (i < len) ? (unsigned char)data[i] : 0;
-      MtlcValue off = mtlc_const_int(L->fn, u64, (long long)i);
-      MtlcValue addr = mtlc_binary(L->fn, "+", mem, off, i8p);
-      mtlc_store(L->fn, addr, mtlc_const_int(L->fn, i8, ch), i8);
+  /* Lazy materialization must be checked in EVERY function that uses the
+   * literal: functions run in arbitrary order, so relying on the module-wide
+   * first lowering site leaves the pointer NULL in earlier-running code. */
+  int ensured_here = 0;
+  for (size_t i = 0; i < buf_len(L->fn_str_ensured); i++)
+    if (strcmp(L->fn_str_ensured[i], ptrname) == 0) {
+      ensured_here = 1;
+      break;
     }
-    mtlc_assign(L->fn, g, mem);
+  if (!ensured_here) {
+    size_t total = len + 1;
+    MtlcValue g = mtlc_global_ref(L->fn, ptrname);
+    char *done = fresh_label(L, "sd");
+    char *need = fresh_label(L, "si");
+    mtlc_branch_if_zero(L->fn, g, need);
+    mtlc_jump(L->fn, done);
+    mtlc_label(L->fn, need);
+    {
+      MtlcValue mem = heap_bytes(L, total, MTLC_NO_VALUE);
+      for (size_t i = 0; i < total; i++) {
+        unsigned char ch = (i < len) ? (unsigned char)data[i] : 0;
+        MtlcValue off = mtlc_const_int(L->fn, u64, (long long)i);
+        MtlcValue addr = mtlc_binary(L->fn, "+", mem, off, i8p);
+        mtlc_store(L->fn, addr, mtlc_const_int(L->fn, i8, ch), i8);
+      }
+      mtlc_assign(L->fn, g, mem);
+    }
+    mtlc_label(L->fn, done);
+    buf_push(L->fn_str_ensured, ptrname);
   }
-  (void)words;
-  mtlc_label(L->fn, done);
-  buf_push(L->str_names, ptrname);
-  buf_push(L->str_contents, arena_strndup(L->arena, data, len));
-  buf_push(L->str_lens, len);
   return mtlc_global_ref(L->fn, ptrname);
 }
 
@@ -1616,6 +1634,15 @@ static void gen_switch(Lower *L, Node *st) {
 static void gen_stmt(Lower *L, Node *st) {
   if (!st)
     return;
+  /* emitted_return means "control cannot fall off the end here". Any
+   * non-return statement (including an if whose branch returned) reopens
+   * the fallthrough path, so reset — the final implicit return is then
+   * emitted (an extra dead ret in all-paths-return functions is harmless).
+   * Without this, a void function with an early `return;` falls off its
+   * end into the next function's code. */
+  if (st->kind != ST_RETURN && st->kind != ST_COMPOUND &&
+      st->kind != ST_CASE && st->kind != ST_DEFAULT)
+    L->emitted_return = 0;
   switch (st->kind) {
   case ST_NULL:
     break;
@@ -1741,6 +1768,12 @@ static void gen_stmt(Lower *L, Node *st) {
   default:
     break;
   }
+  /* A structured statement with internal labels (if/loops/switch) reopens
+   * the fallthrough path even when a nested `return` ran; only statements
+   * that merely wrap a trailing child keep the child's verdict. */
+  if (st->kind == ST_IF || st->kind == ST_WHILE || st->kind == ST_DO ||
+      st->kind == ST_FOR || st->kind == ST_SWITCH)
+    L->emitted_return = 0;
 }
 
 static void declare_runtime(MtlcBuilder *b) {
@@ -1819,6 +1852,7 @@ static void gen_function(Lower *L, Node *fn) {
   L->ptr_vals = NULL;
   L->ret_type = ft->base;
   L->emitted_return = 0;
+  L->fn_str_ensured = NULL;
   L->loop = NULL;
   L->has_va = is_var;
   L->va_param = MTLC_NO_VALUE;
@@ -1937,6 +1971,7 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
         NULL, 0, 0);
     if (initfn) {
       L.fn = initfn;
+      L.fn_str_ensured = NULL;
       L.nlocals = 0;
       L.local_syms = NULL;
       L.local_vals = NULL;
