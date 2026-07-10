@@ -759,11 +759,18 @@ static MtlcValue gen_indirect_call(Lower *L, MtlcValue fp, Node *call) {
     args[i] = gen_expr(L, call->stmts[i]);
 
   for (size_t i = 0; i < L->nfptrs; i++) {
-    /* an entry with a different fixed arity cannot be this call's target */
+    /* an entry whose IR signature cannot match this call site is skipped:
+     * different fixed arity, variadic (hidden __va param convention), or
+     * aggregate return (hidden sret param). */
     Type *cand = L->fptrs[i].fn_type;
-    if (cand && cand->kind == TY_FUNC && !cand->is_variadic &&
-        cand->param_count != n)
-      continue;
+    if (cand && cand->kind == TY_FUNC) {
+      if (cand->is_variadic)
+        continue;
+      if (cand->param_count != n)
+        continue;
+      if (cand->base && is_agg(cand->base) && cand->base->kind != TY_ARRAY)
+        continue;
+    }
     char *hit = fresh_label(L, "ichit");
     char *next = fresh_label(L, "icnext");
     MtlcValue id =
@@ -869,6 +876,14 @@ static void gen_init_into(Lower *L, Type *ty, MtlcValue base_addr, Node *init,
                                 (unsigned char)ch),
                  mtlc_type_scalar(MTLC_TYPE_INT8));
     }
+    return;
+  }
+  /* aggregate copy-initialization: `P y = x;` — copy the object bytes */
+  if (ty && is_agg(ty) && ty->kind != TY_COMPLEX && init->kind != EX_INIT_LIST &&
+      init->type && is_agg(init->type)) {
+    MtlcValue src = gen_expr(L, init); /* aggregate rvalues are addresses */
+    size_t sz = ty->size ? ty->size : 8;
+    mem_copy(L, base_addr, src, sz);
     return;
   }
   /* scalar or complex value */
@@ -1086,16 +1101,23 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
     }
 
     Type *ct = e->type;
-    if (is_cmp(e->op))
-      ct = L->tc->ty_int;
-    else if (type_is_arithmetic(lt) && type_is_arithmetic(rt))
+    if (is_cmp(e->op)) {
+      /* Compare in the common operand type: mtlc keys signed-vs-unsigned and
+       * float-vs-int comparison selection off the result_type. */
+      if (type_is_arithmetic(lt) && type_is_arithmetic(rt))
+        ct = type_usual_arith(L->tc, lt, rt);
+      else
+        ct = L->tc->ty_ullong; /* pointer comparisons are unsigned */
+    } else if (type_is_arithmetic(lt) && type_is_arithmetic(rt))
       ct = type_usual_arith(L->tc, lt, rt);
 
     lhs = cast_to(L, lhs, lt, ct);
     rhs = cast_to(L, rhs, rt, ct);
-    const MtlcType *rt_mtlc =
-        is_cmp(e->op) ? mtlc_type_scalar(MTLC_TYPE_INT32) : mtlc_of(ct);
-    return mtlc_binary(L->fn, binop_mtlc(e->op), lhs, rhs, rt_mtlc);
+    const MtlcType *rt_mtlc = mtlc_of(ct);
+    MtlcValue r = mtlc_binary(L->fn, binop_mtlc(e->op), lhs, rhs, rt_mtlc);
+    if (is_cmp(e->op) && type_is_float(ct))
+      r = mtlc_cast(L->fn, r, mtlc_type_scalar(MTLC_TYPE_INT32));
+    return r;
   }
   case EX_UNARY: {
     if (e->op == OP_ADDR) {
@@ -1306,12 +1328,22 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
           args[base_off + i] = gen_expr(L, e->stmts[i]);
         MtlcValue buf = alloc_bytes(L, (extra ? extra : 1) * 8, 0, MTLC_NO_VALUE);
         for (size_t i = 0; i < extra; i++) {
-          MtlcValue v = gen_expr(L, e->stmts[fixed + i]);
+          Node *argn = e->stmts[fixed + i];
+          MtlcValue v = gen_expr(L, argn);
           MtlcValue off = mtlc_const_int(
               L->fn, mtlc_type_scalar(MTLC_TYPE_UINT64), (long long)(i * 8));
           MtlcValue a = mtlc_binary(L->fn, "+", buf, off, i8p_ty());
-          v = mtlc_cast(L->fn, v, mtlc_type_scalar(MTLC_TYPE_INT64));
-          mtlc_store(L->fn, a, v, mtlc_type_scalar(MTLC_TYPE_INT64));
+          if (argn->type && type_is_float(argn->type)) {
+            /* default argument promotion: store the double's bits, not a
+             * numeric int conversion */
+            const MtlcType *f64 = mtlc_type_scalar(MTLC_TYPE_FLOAT64);
+            v = mtlc_cast(L->fn, v, f64);
+            MtlcValue fp = mtlc_cast(L->fn, a, mtlc_type_pointer(f64));
+            mtlc_store(L->fn, fp, v, f64);
+          } else {
+            v = mtlc_cast(L->fn, v, mtlc_type_scalar(MTLC_TYPE_INT64));
+            mtlc_store(L->fn, a, v, mtlc_type_scalar(MTLC_TYPE_INT64));
+          }
         }
         args[base_off + fixed] = buf;
         MtlcValue r = mtlc_call(L->fn, cname, args, fixed + 1 + base_off,
@@ -1797,8 +1829,30 @@ static void gen_function(Lower *L, Node *fn) {
     L->sret_param = mtlc_fn_param(mf, 0);
   for (size_t i = 0; i < nparams; i++) {
     MtlcValue p = mtlc_fn_param(mf, arg0 + i);
-    if (fn->params[i]->sym)
-      bind_local(L, fn->params[i]->sym, p);
+    if (!fn->params[i]->sym)
+      continue;
+    Type *pt = fn->params[i]->type;
+    if (pt && is_agg(pt) && pt->kind != TY_ARRAY) {
+      /* Aggregate passed by value: the incoming IR value is a pointer to
+       * the caller's object. Copy into our own storage (C by-value
+       * semantics) and bind like an aggregate local. */
+      size_t sz = pt->size ? pt->size : 8;
+      MtlcValue copy = stack_bytes(
+          L, sz,
+          arena_sprintf(L->arena, "%s_byval",
+                        fn->params[i]->name ? fn->params[i]->name : "arg"));
+      mem_copy(L, copy, p, sz);
+      MtlcValue loc = mtlc_local(
+          L->fn,
+          arena_sprintf(L->arena, "%s_p",
+                        fn->params[i]->name ? fn->params[i]->name : "arg"),
+          i8p_ty());
+      mtlc_assign(L->fn, loc, copy);
+      bind_local(L, fn->params[i]->sym, loc);
+      bind_ptr(L, fn->params[i]->sym, loc);
+      continue;
+    }
+    bind_local(L, fn->params[i]->sym, p);
   }
   if (is_var)
     L->va_param = mtlc_fn_param(mf, arg0 + nparams);
