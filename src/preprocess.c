@@ -448,7 +448,7 @@ static long long eval_pp_expr(PP *pp, const char *path, int line,
 /* ---- expansion ---- */
 
 static char *expand_line(PP *pp, const char *path, int line, const char *in,
-                         int disable_macro_name);
+                         int disable_macro_name, int start_in_comment);
 
 static char *stringify_arg(Arena *a, const char *arg) {
   char *out = NULL;
@@ -549,15 +549,24 @@ static char *subst_macro(PP *pp, const char *path, int line, Macro *m,
   char *substituted = arena_strdup(pp->arena, out);
   buf_free(out);
   /* rescan */
-  return expand_line(pp, path, line, substituted, /*disable*/ 0);
+  return expand_line(pp, path, line, substituted, /*disable*/ 0, 0);
 }
 
 static char *expand_line(PP *pp, const char *path, int line, const char *in,
-                         int disable_macro_name) {
+                         int disable_macro_name, int start_in_comment) {
   (void)disable_macro_name;
   size_t n = strlen(in);
   char *out = NULL;
   size_t i = 0;
+  /* the line begins inside a block comment: copy verbatim until it closes */
+  if (start_in_comment) {
+    while (i < n && !(in[i] == '*' && i + 1 < n && in[i + 1] == '/'))
+      buf_push(out, in[i++]);
+    if (i + 1 < n) {
+      buf_push(out, in[i++]);
+      buf_push(out, in[i++]);
+    }
+  }
   while (i < n) {
     /* Do not expand inside comments (C: comments are spaces before macros). */
     if (in[i] == '/' && i + 1 < n && in[i + 1] == '/') {
@@ -1074,7 +1083,7 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
             inc_name = arena_strndup(pp->arena, rest + 1, e - 1);
           } else {
             /* macro-expanded include */
-            char *exp = expand_line(pp, path, line, rest, 0);
+            char *exp = expand_line(pp, path, line, rest, 0, 0);
             while (*exp == ' ' || *exp == '\t')
               exp++;
             if (exp[0] == '"') {
@@ -1120,7 +1129,7 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
           pp_error(pp, path, line, "#error %s", rest);
         } else if (dir && strcmp(dir, "line") == 0) {
           /* #line number ["file"] */
-          char *exp = expand_line(pp, path, line, rest, 0);
+          char *exp = expand_line(pp, path, line, rest, 0, 0);
           while (*exp == ' ' || *exp == '\t')
             exp++;
           long new_line = strtol(exp, &exp, 10);
@@ -1159,6 +1168,7 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
        * preserve numbering. Directives stop the merge. */
       int merged_lines = 0;
       size_t cmt_at = 0;
+      int line_start_in_comment = text_in_comment;
       int depth = line_paren_depth_c2(raw, 0, &text_in_comment, &cmt_at);
       char *logical = raw;
       if (depth > 0 && cmt_at < strlen(raw))
@@ -1178,12 +1188,15 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
         size_t nl = strlen(nraw);
         if (nl && nraw[nl - 1] == '\r')
           nraw[nl - 1] = 0;
+        size_t ncmt = 0;
+        depth = line_paren_depth_c2(nraw, depth, &text_in_comment, &ncmt);
+        if (ncmt < strlen(nraw))
+          nraw = arena_strndup(pp->arena, nraw, ncmt);
         logical = arena_sprintf(pp->arena, "%s %s", logical, nraw);
-        depth = line_paren_depth_c(nraw, depth, &text_in_comment);
         next = (le < n) ? le + 1 : le;
         merged_lines++;
       }
-      char *exp = expand_line(pp, path, line, logical, 0);
+      char *exp = expand_line(pp, path, line, logical, 0, line_start_in_comment);
       for (char *q = exp; *q; q++)
         buf_push(out, *q);
       for (int m = 0; m < merged_lines; m++)
