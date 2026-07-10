@@ -82,6 +82,37 @@ void sema_init(Sema *S, Arena *arena, Diag *diag, TypeContext *tc) {
   scope_push(S); /* global */
 }
 
+/* Complete `T x[] = {...}` / `char s[] = "..."` from the initializer
+ * (C99 6.7.8p22). */
+static void sema_infer_array_len(Sema *S, Node *d) {
+  Type *ty = d->type;
+  if (!ty || ty->kind != TY_ARRAY || ty->array_len != 0 || !d->init)
+    return;
+  size_t n = 0;
+  if (d->init->kind == EX_INIT_LIST) {
+    size_t seq = 0;
+    for (size_t i = 0; i < buf_len(d->init->stmts); i++) {
+      Node *item = d->init->stmts[i];
+      size_t idx = seq;
+      if (item->is_designated && item->init && item->init->kind == EX_INT)
+        idx = (size_t)item->init->ival;
+      seq = idx + 1;
+      if (seq > n)
+        n = seq;
+    }
+  } else if (d->init->kind == EX_STRING) {
+    n = d->init->str_len + 1;
+  } else {
+    return;
+  }
+  if (n == 0)
+    n = 1;
+  d->type = type_array(S->tc, ty->base, n);
+  d->decl_type = d->type;
+  if (d->sym)
+    d->sym->type = d->type;
+}
+
 /* ---- type resolution for typedef placeholders ---- */
 
 static Type *resolve_type(Sema *S, Type *t) {
@@ -650,6 +681,7 @@ static void check_decl(Sema *S, Node *d, int is_global) {
       diag_error(S->diag, d->loc, "variable requires a name");
       return;
     }
+    sema_infer_array_len(S, d);
     Type *ty = d->type;
     Symbol *sym = d->sym;
     if (!sym) {
@@ -680,11 +712,11 @@ void sema_check(Sema *S, Program *prog) {
       d->type = d->decl_type;
       Symbol *sym = scope_insert(S, SYM_FUNC, d->name, d->type, d);
       sym->is_global = 1;
-      sym->is_static = (d->storage == SC_STATIC);
-      sym->is_extern = !sym->is_static && !d->is_definition;
-      sym->link_name = d->name;
+      sym->is_static = sym->is_static || (d->storage == SC_STATIC);
       if (d->is_definition)
         sym->is_defined = 1;
+      sym->is_extern = !sym->is_static && !sym->is_defined;
+      sym->link_name = d->name;
       d->sym = sym;
       buf_push(S->globals, sym);
     } else if (d->kind == D_TYPEDEF && d->name) {
@@ -697,6 +729,7 @@ void sema_check(Sema *S, Program *prog) {
     } else if (d->kind == D_VAR && d->name) {
       d->decl_type = resolve_type(S, d->decl_type);
       d->type = d->decl_type;
+      sema_infer_array_len(S, d);
       Symbol *sym = scope_insert(S, SYM_VAR, d->name, d->type, d);
       sym->is_global = 1;
       sym->is_static = (d->storage == SC_STATIC);

@@ -273,6 +273,11 @@ int main(int argc, char **argv) {
         char *mangled = arena_sprintf(&arena, "__st%zu_%s", i, old);
         for (size_t j = 0; j < buf_len(prog->decls); j++) {
           Node *fn = prog->decls[j];
+          if (fn->kind == D_VAR && fn->init && fn != decl) {
+            /* file-scope initializers may reference the static too */
+            rename_static_uses(fn->init, old, mangled, 0);
+            continue;
+          }
           if (fn->kind != D_FUNC || !fn->is_definition)
             continue;
           int sh = 0;
