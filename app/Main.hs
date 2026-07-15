@@ -51,8 +51,8 @@ usage = do
   v <- Mtlc.version
   mapM_
     (hPutStrLn stderr)
-    [ "C99Mettle - C99 compiler (libmtlc backend, Haskell frontend)"
-    , "Usage: c99mtlc-hs [options] <file.c>..."
+    [ "C99Mettle - C99 compiler (libmtlc backend)"
+    , "Usage: c99mtlc [options] <file.c>..."
     , "Options:"
     , "  -o <path>     output executable (default: a.exe)"
     , "  -I <dir>      add include search path"

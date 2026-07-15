@@ -60,7 +60,7 @@ foreign import ccall unsafe "mtlc_type_scalar"
 foreign import ccall unsafe "mtlc_type_pointer"
   c_mtlc_type_pointer :: TypePtr -> IO TypePtr
 
--- | From hs/cbits/blob.c, not libmtlc: an interned array-of-uint8 descriptor,
+-- | From cbits/blob.c, not libmtlc: an interned array-of-uint8 descriptor,
 -- which build.h offers no constructor for.
 foreign import ccall unsafe "c99m_blob_type"
   c_c99m_blob_type :: CSize -> IO TypePtr

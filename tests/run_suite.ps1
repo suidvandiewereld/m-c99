@@ -8,8 +8,8 @@ $Scratch = $args[0]
 if (-not $Scratch) {
   $Scratch = Join-Path $env:TEMP "c99mtlc-suite"
 }
-# Which frontend to exercise. Defaults to the C one; set C99MTLC to point at
-# another (e.g. bin\c99mtlc-hs.exe, the Haskell frontend).
+# Which compiler to exercise. Defaults to the freshly built bin\c99mtlc.exe;
+# set C99MTLC to point at another build.
 $CC = $env:C99MTLC
 if (-not $CC) { $CC = Join-Path $Root "bin\c99mtlc.exe" }
 if (-not (Test-Path $CC)) { Write-Error "missing $CC"; exit 1 }
