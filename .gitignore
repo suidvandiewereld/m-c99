@@ -1,6 +1,17 @@
-libmtlc/docs
+# build output
 bin/
+build/
 third_party/
+libmtlc/docs
 *.exe
 *.obj
 *.o
+
+# regression-suite scratch (tests/run_suite.ps1 writes here)
+-ScratchDir/
+
+# in-tree backups
+*.orig-bak
+
+# empty scratch dir
+mcps/

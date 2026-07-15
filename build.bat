@@ -2,15 +2,29 @@
 setlocal
 cd /d "%~dp0"
 
-set CC=gcc
-set CFLAGS=-std=c11 -Wall -Wextra -O2 -I src -I libmtlc\include
-set SRC=src\common.c src\token.c src\lexer.c src\ast.c src\ctype.c src\parser.c src\sema.c src\lower.c src\preprocess.c src\main.c
-set LIBS=libmtlc\lib\mtlc.lib -ldbghelp
+rem The c99mtlc frontend (Haskell). Built with `ghc --make` rather than cabal:
+rem every dependency is a GHC boot library, so no package index is needed.
+rem GHC comes from GHCup (https://www.haskell.org/ghcup/).
+
+set GHC=ghc
+where %GHC% >nul 2>nul
+if errorlevel 1 set GHC=%USERPROFILE%\.ghcup\bin\ghc.exe
+if not exist "%GHC%" if not "%GHC%"=="ghc" (
+  echo GHC not found. Install it with ghcup, or put ghc on PATH.
+  exit /b 1
+)
 
 if not exist bin mkdir bin
+if not exist build\hs mkdir build\hs
 
-echo Building c99mtlc...
-%CC% %CFLAGS% %SRC% %LIBS% -o bin\c99mtlc.exe
+echo Building bin\c99mtlc.exe ...
+%GHC% --make -O2 -Wall ^
+  -isrc -iapp ^
+  -outputdir build\hs ^
+  -optc-Ilibmtlc\include ^
+  app\Main.hs cbits\blob.c ^
+  libmtlc\lib\mtlc.lib -ldbghelp ^
+  -o bin\c99mtlc.exe
 if errorlevel 1 (
   echo Build failed.
   exit /b 1
