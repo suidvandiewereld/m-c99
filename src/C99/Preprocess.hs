@@ -14,6 +14,7 @@ import C99.Common (Message (..), Severity (..), SrcLoc (..), diag)
 import Control.Exception (IOException, try)
 import Control.Monad.State.Strict
 import qualified Data.ByteString.Char8 as BS
+import Data.ByteString.Char8 (ByteString)
 import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Char (digitToInt, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
@@ -633,30 +634,39 @@ ppError path line text =
 recompute :: PPM ()
 recompute = modify $ \s -> s {stDisabled = any (/= 1) (stIfStack s)}
 
-lineMarker :: Int -> FilePath -> String
-lineMarker line path = "# " ++ show line ++ " \"" ++ map fwd path ++ "\"\n"
+-- | A single newline chunk. The preprocessor emits blank lines constantly to
+-- keep physical line numbering, so this shared 'ByteString' saves packing one
+-- for every splice and every disabled line.
+nlB :: ByteString
+nlB = BS.singleton '\n'
+
+lineMarker :: Int -> FilePath -> ByteString
+lineMarker line path = BS.pack ("# " ++ show line ++ " \"" ++ map fwd path ++ "\"\n")
   where
     fwd '\\' = '/'
     fwd c = c
 
 -- ---- one buffer ----
 
-ppBuffer :: FilePath -> String -> PPM String
+ppBuffer :: FilePath -> String -> PPM ByteString
 ppBuffer path raw = do
   stack <- gets stIncludeStack
   if path `elem` stack
     then do
       ppError path 1 "include cycle"
-      return ""
+      return BS.empty
     else do
       modify $ \s -> s {stIncludeStack = path : stIncludeStack s}
       src <- cachedPhysLines path raw
       chunks <- ppLines path src 1 False [lineMarker 1 path]
       modify $ \s -> s {stIncludeStack = drop 1 (stIncludeStack s)}
-      return (concat (reverse chunks))
+      return (BS.concat (reverse chunks))
 
--- | @acc@ holds the emitted chunks in reverse order.
-ppLines :: FilePath -> [String] -> Int -> Bool -> [String] -> PPM [String]
+-- | @acc@ holds the emitted chunks in reverse order. Each chunk is a
+-- 'ByteString', so the whole translation unit is assembled with a single
+-- 'BS.concat' at the end rather than materializing a @[Char]@ list that the
+-- lexer would immediately pack straight back into bytes.
+ppLines :: FilePath -> [String] -> Int -> Bool -> [ByteString] -> PPM [ByteString]
 ppLines _ [] _ _ acc = return acc
 ppLines path (raw : rest) line inCmt acc
   | not inCmt, ('#' : _) <- dropWhile isSpaceTab raw = do
@@ -665,7 +675,7 @@ ppLines path (raw : rest) line inCmt acc
   | otherwise = do
       dis <- gets stDisabled
       if dis
-        then ppLines path rest (line + 1) inCmt ("\n" : acc)
+        then ppLines path rest (line + 1) inCmt (nlB : acc)
         else do
           tbl <- gets stMacros
           let (d0, cmt1, cmtAt) = lineParenDepth raw 0 inCmt
@@ -674,7 +684,7 @@ ppLines path (raw : rest) line inCmt acc
                 | otherwise = raw
               (logical, merged, inCmt', rest') = mergeLines d0 cmt1 logical0 rest 0
               expanded = expandLine tbl path line logical inCmt
-              acc' = "\n" : replicate merged "\n" ++ (expanded : acc)
+              acc' = nlB : replicate merged nlB ++ (BS.pack expanded : acc)
           ppLines path rest' (line + merged + 1) inCmt' acc'
 
 -- | A function-like invocation may span physical lines: while the line leaves
@@ -737,7 +747,7 @@ resolveDefined tbl = go
             Nothing -> False
        in (if found then "1" else "0") ++ go r3
 
-directive :: FilePath -> String -> Int -> [String] -> PPM [String]
+directive :: FilePath -> String -> Int -> [ByteString] -> PPM [ByteString]
 directive path raw line acc = do
   let afterHash = dropWhile isSpaceTab (drop 1 (dropWhile isSpaceTab raw))
       (dir, s2) = readIdent afterHash
@@ -806,7 +816,7 @@ directive path raw line acc = do
           Just "line" -> doLine path line rest acc
           _ -> return (nl acc)
   where
-    nl a = "\n" : a
+    nl a = nlB : a
     flipTop t
       | t == 1 = 2
       | t == 0 = 1
@@ -859,7 +869,7 @@ doDefine path line rest0 = case readIdent rest of
       (')' : r) -> r
       r -> r
 
-doInclude :: FilePath -> Int -> String -> [String] -> PPM [String]
+doInclude :: FilePath -> Int -> String -> [ByteString] -> PPM [ByteString]
 doInclude path line rest acc = do
   tbl <- gets stMacros
   let target = case rest of
@@ -885,20 +895,20 @@ doInclude path line rest acc = do
             Just src -> do
               incOut <- ppBuffer fp src
               let acc1 = incOut : acc
-                  acc2 = if lastCharIsNL acc1 then acc1 else "\n" : acc1
+                  acc2 = if lastCharIsNL acc1 then acc1 else nlB : acc1
               return (lineMarker (line + 1) path : acc2)
   where
-    nl a = "\n" : a
+    nl a = nlB : a
     parseName ('"' : r) = Just (False, takeWhile (/= '"') r)
     parseName ('<' : r) = Just (True, takeWhile (/= '>') r)
     parseName _ = Nothing
 
-lastCharIsNL :: [String] -> Bool
-lastCharIsNL cs = case filter (not . null) cs of
-  (c : _) -> last c == '\n'
+lastCharIsNL :: [ByteString] -> Bool
+lastCharIsNL cs = case filter (not . BS.null) cs of
+  (c : _) -> BS.last c == '\n'
   [] -> False
 
-doLine :: FilePath -> Int -> String -> [String] -> PPM [String]
+doLine :: FilePath -> Int -> String -> [ByteString] -> PPM [ByteString]
 doLine path line rest acc = do
   tbl <- gets stMacros
   let e0 = dropWhile isSpaceTab (expandLine tbl path line rest False)
@@ -909,7 +919,7 @@ doLine path line rest acc = do
         _ -> path
   if newLine > 0
     then return (lineMarker newLine newFile : acc)
-    else return ("\n" : acc)
+    else return (nlB : acc)
 
 -- ---- predefined macros ----
 
@@ -962,11 +972,11 @@ predefs = foldl' (flip macroDefine) emptyTable (objs ++ fnNoops ++ objNoops ++ [
 
 -- | Preprocess the file at the given path. Returns the expanded text and any
 -- diagnostics. Reads @#include@'d files from disk, hence IO.
-preprocess :: PPOptions -> FilePath -> IO (String, [Message])
+preprocess :: PPOptions -> FilePath -> IO (ByteString, [Message])
 preprocess opts path = do
   msrc <- cachedRead (ppCache opts) path
   case msrc of
-    Nothing -> return ("", [diag Error (SrcLoc path 1 1) "cannot read file"])
+    Nothing -> return (BS.empty, [diag Error (SrcLoc path 1 1) "cannot read file"])
     Just src -> do
       let st0 =
             St

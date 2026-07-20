@@ -9,13 +9,15 @@ module C99.Lexer
 
 import Control.Monad (replicateM_, unless, void, when)
 import Control.Monad.State.Strict
+import qualified Data.ByteString.Char8 as BS
+import Data.ByteString.Char8 (ByteString)
 import Data.Char (chr, digitToInt, isDigit, isHexDigit, isOctDigit, ord)
 
 import C99.Common (Message (..), Severity (..), SrcLoc (..), diag, withCode, withLabel, withLen)
 import C99.Token
 
 data LexState = LexState
-  { lsRest :: String
+  { lsRest :: !ByteString
   , lsFile :: FilePath
   , lsLine :: !Int
   , lsCol :: !Int
@@ -26,7 +28,7 @@ type Lex a = State LexState a
 
 -- | Tokenize @src@, which is attributed to @path@ until a line marker says
 -- otherwise. The token list always ends with TkEof.
-tokenize :: FilePath -> String -> ([Token], [Message])
+tokenize :: FilePath -> ByteString -> ([Token], [Message])
 tokenize path src =
   let (toks, st) = runState loop (LexState src path 1 1 [])
    in (toks, reverse (lsMsgs st))
@@ -53,30 +55,27 @@ measured act = do
       n
         | tokKind t == TkEof = 0
         | sameLine = lsCol after - locCol (tokLoc t)
-        | otherwise = max 1 (length (takeWhile (/= '\n') (lsRest before)))
+        | otherwise =
+            let r = lsRest before in max 1 (maybe (BS.length r) id (BS.elemIndex '\n' r))
   pure t {tokLen = max 0 n}
 
 -- ---- primitives ----
 
 peekC :: Lex Char
-peekC = gets (headOr '\0' . lsRest)
+peekC = gets (\st -> let r = lsRest st in if BS.null r then '\0' else BS.head r)
 
 peek2C :: Lex Char
-peek2C = gets (headOr '\0' . drop 1 . lsRest)
-
-headOr :: Char -> String -> Char
-headOr d [] = d
-headOr _ (c : _) = c
+peek2C = gets (\st -> let r = lsRest st in if BS.length r < 2 then '\0' else BS.index r 1)
 
 atEnd :: Lex Bool
-atEnd = gets (null . lsRest)
+atEnd = gets (BS.null . lsRest)
 
 advance :: Lex Char
 advance = do
   st <- get
-  case lsRest st of
-    [] -> pure '\0'
-    (c : cs) -> do
+  case BS.uncons (lsRest st) of
+    Nothing -> pure '\0'
+    Just (c, cs) -> do
       put $
         if c == '\n'
           then st {lsRest = cs, lsLine = lsLine st + 1, lsCol = 1}
@@ -100,29 +99,36 @@ errWith loc n code text mlabel = modify' $ \st -> st {lsMsgs = m : lsMsgs st}
           withLen n $
             diag Error loc text
 
--- | Consume while the predicate holds, returning what was consumed.
+-- | Consume while the predicate holds, returning the slice consumed.
 --
--- One state write for the whole run — identifiers, numbers, whitespace and
--- comment bodies all come through here, and going char-by-char through
--- 'advance' costs a fresh state record per character.
-takeWhileL :: (Char -> Bool) -> Lex String
-takeWhileL p = do
+-- One state write for the whole run, and the slice is a view into the source
+-- buffer rather than a fresh copy: identifiers, numbers, whitespace and comment
+-- bodies all come through here, so a copy per run was the lexer's biggest source
+-- of garbage. 'BS.span' hands back a zero-copy view; only 'takeWhileL' below
+-- materializes a String, and only where a caller actually needs the text.
+spanL :: (Char -> Bool) -> Lex ByteString
+spanL p = do
   st <- get
-  let (chunk, rest) = span p (lsRest st)
+  let (chunk, rest) = BS.span p (lsRest st)
       (line', col') = advanceLoc (lsLine st) (lsCol st) chunk
   put st {lsRest = rest, lsLine = line', lsCol = col'}
   pure chunk
 
--- | Where the location ends up after consuming @chunk@.
-advanceLoc :: Int -> Int -> String -> (Int, Int)
-advanceLoc = go
-  where
-    go !l !c [] = (l, c)
-    go !l _ ('\n' : r) = go (l + 1) 1 r
-    go !l !c (_ : r) = go l (c + 1) r
+-- | Consume while the predicate holds, returning the text consumed.
+takeWhileL :: (Char -> Bool) -> Lex String
+takeWhileL p = BS.unpack <$> spanL p
+
+-- | Where the location ends up after consuming @chunk@. Newlines are counted
+-- and the last one found with C-level scans, so a long run costs no per-char
+-- Haskell work.
+advanceLoc :: Int -> Int -> ByteString -> (Int, Int)
+advanceLoc l c chunk =
+  case BS.elemIndexEnd '\n' chunk of
+    Nothing -> (l, c + BS.length chunk)
+    Just i -> (l + BS.count '\n' chunk, BS.length chunk - i)
 
 skipWhile :: (Char -> Bool) -> Lex ()
-skipWhile p = () <$ takeWhileL p
+skipWhile p = void (spanL p)
 
 -- ---- whitespace, comments, line markers ----
 
@@ -169,7 +175,7 @@ directive = do
   _ <- advance -- #
   skipWhile (`elem` " \t")
   rest <- gets lsRest
-  when (take 4 rest == "line") $ do
+  when (BS.pack "line" `BS.isPrefixOf` rest) $ do
     replicateM_ 4 advance
     skipWhile (`elem` " \t")
   c <- peekC
