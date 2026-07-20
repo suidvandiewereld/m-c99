@@ -17,21 +17,22 @@ with gcc).
 
 ## Current state
 
-One of these fails, and it is checked in deliberately: it is a real,
-reproduced miscompile and the file is the smallest program that shows it.
+All twenty-five pass. Ten were failing when this directory was created, and
+each has a reproduction here so a regression cannot slip back in:
 
-| File | What is wrong | Issue |
-|---|---|---|
-| `many_args.c` | a call with many arguments clobbers the caller's floating-point locals | #14 |
+- `++`/`--` on a scalar global
+- signed bit-fields
+- `int >> unsigned`
+- a nested shift
+- a `case` in a nested block (and Duff's device)
+- flexible array members
+- a function pointer returning a struct
+- a variadic call destroying a `double`
+- a call with many arguments clobbering the caller's floating-point locals
+- the header/archive skew that made the backend crash on ordinary C
 
-That one is a backend fault. The fix is known and is one line in
-MettleToolchain, but it cannot be shipped from here yet; see the issue.
-
-The other twenty-four pass, including the eight that were failing when this
-directory was created: `++`/`--` on a scalar global, signed bit-fields,
-`int >> unsigned`, a nested shift, a `case` in a nested block (and Duff's
-device), flexible array members, a function pointer returning a struct, and a
-variadic call destroying a `double`.
+The last three were backend faults, fixed in MettleToolchain and vendored back
+in through `vendor-libmtlc.sh`. See issues #13, #14 and #15.
 
 ## Adding a case
 
