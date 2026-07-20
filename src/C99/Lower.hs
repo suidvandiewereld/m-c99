@@ -1196,21 +1196,13 @@ genBinary e op l r
                     | typeIsArithmetic lt && typeIsArithmetic rt =
                         typeUsualArith tc lt rt
                     | otherwise = exprTy e
-              lv0 <- castTo lv lt ct
-              -- A signed right shift needs its left operand to be canonical in
-              -- the machine word: the backend computes in 64 bits and only
-              -- sign-extends a narrow value on the way into a *named* local,
-              -- not into a temporary. So `(x << 28) >> 28` shifted a register
-              -- whose top 32 bits were clean zeros and produced 15 instead of
-              -- -1, while the same thing through a variable was right.
-              --
-              -- Giving the operand a name is exactly what the backend needs to
-              -- see. It costs one local per nested signed shift, and only when
-              -- the operand is itself computed.
-              lv' <-
-                if op == Shr && not (typeIsUnsigned ct) && needsHome l
-                  then materialize lv0 ct
-                  else pure lv0
+              lv' <- castTo lv lt ct
+              -- A signed right shift whose left operand is a computed temporary
+              -- (`(x << 28) >> 28`) used to need that operand copied into a
+              -- named local, because the backend only sign-extended a narrow
+              -- value on the way into a name, not into a temporary. libmtlc now
+              -- canonicalizes narrow temporaries at their definition (issue #13),
+              -- so the extra local is no longer needed.
               -- the count keeps its own type; only its value matters
               rv' <- if isShift then pure rv else castTo rv rt ct
               ct' <- mtlcOf ct
@@ -1423,19 +1415,6 @@ retTy t = mtlcOf t
 isArrayTy :: Type -> Bool
 isArrayTy TArray {} = True
 isArrayTy _ = False
-
--- | Whether this expression's value is a computed temporary rather than
--- something that already lives in a named place.
---
--- A name reads back canonically for its declared width; a temporary does not.
--- Only used to decide whether a signed right shift needs its left operand
--- copied into a local first.
-needsHome :: Expr -> Bool
-needsHome e = case exNode e of
-  EIdent _ _ -> False
-  EInt _ _ -> False
-  EChar _ -> False
-  _ -> True
 
 genDirectCall :: Expr -> Symbol -> [Expr] -> Lower Value
 genDirectCall e sym args = do
