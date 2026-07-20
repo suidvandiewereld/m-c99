@@ -53,7 +53,7 @@ data LowerState = LowerState
     -- one yields the address, never a load through it.
     lsPtrs :: M.Map SymId Value
   , -- | Interned string literals: content -> name of its pointer global.
-    lsStrings :: [(String, String)]
+    lsStrings :: M.Map String String
   , -- | Pointer globals already lazily-initialized in the current function.
     -- Functions run in arbitrary order, so this must be per-function: relying
     -- on the module-wide first use leaves the pointer null in earlier callers.
@@ -88,7 +88,7 @@ lowerProgram sr = do
           , lsStrId = 0
           , lsLocals = M.empty
           , lsPtrs = M.empty
-          , lsStrings = []
+          , lsStrings = M.empty
           , lsFnStrEnsured = []
           , lsLoop = []
           , lsRetType = Nothing
@@ -210,6 +210,41 @@ castTo v from to
       fn <- gets lsFn
       ty <- mtlcOf to
       lift (cast fn v ty)
+
+-- | Advance a pointer by @iv@ /elements/, yielding a value of type @resTy@.
+--
+-- libmtlc's 'binary' does no implicit pointer scaling, so the element size has
+-- to be applied here. Every site that moves a pointer goes through this: not
+-- just @p + n@ but @p++@, @--p@ and @p += n@ too, which is why it is top-level
+-- rather than local to 'genBinary'.
+ptrStep :: Value -> Value -> Type -> String -> Type -> Lower Value
+ptrStep pv iv el o resTy = do
+  fn <- gets lsFn
+  u64 <- u64L
+  esz <- max 1 <$> sizeOf el
+  scale <- lift (constInt fn u64 (fromIntegral esz))
+  i <- lift (cast fn iv u64)
+  off <- lift (binary fn "*" i scale u64)
+  p <- lift (cast fn pv u64)
+  sum' <- lift (binary fn o p off u64)
+  t <- mtlcOf resTy
+  lift (cast fn sum' t)
+
+-- | The @+ 1@ / @- 1@ behind @++@ and @--@, scaled by the pointee size when the
+-- operand is a pointer. @opTy@ is the operand's own type; @resTy@ types the
+-- arithmetic in the ordinary scalar case.
+stepOne :: Type -> Type -> Value -> String -> Lower Value
+stepOne opTy resTy cur o = do
+  fn <- gets lsFn
+  case typeDecay opTy of
+    TPtr el -> do
+      u64 <- u64L
+      one <- lift (constInt fn u64 1)
+      ptrStep cur one el o opTy
+    _ -> do
+      t <- mtlcOf resTy
+      one <- lift (constInt fn t 1)
+      lift (binary fn o cur one t)
 
 -- ---- memory ----
 
@@ -427,7 +462,7 @@ genInit1 (IList _) = do
 genString :: String -> Lower Value
 genString s = do
   interned <- gets lsStrings
-  ptrname <- case lookup s interned of
+  ptrname <- case M.lookup s interned of
     Just p -> pure p
     Nothing -> newString s
   ensureString ptrname s
@@ -448,7 +483,7 @@ newString s = do
   p <- i8pL
   let ptrname = base ++ "_p"
   lift (builderGlobal b ptrname p 0 False)
-  modify' $ \st -> st {lsStrings = (s, ptrname) : lsStrings st}
+  modify' $ \st -> st {lsStrings = M.insert s ptrname (lsStrings st)}
   pure ptrname
   where
     chunk8 [] = []
@@ -803,10 +838,8 @@ genExpr e = case exNode e of
     fn <- gets lsFn
     addr <- genLvalueAddr x
     lt <- mtlcOf (exprTy x)
-    t <- mtlcOf (exprTy e)
     cur <- lift (load fn addr lt)
-    one <- lift (constInt fn t 1)
-    nv <- lift (binary fn (if op == PostInc then "+" else "-") cur one t)
+    nv <- stepOne (exprTy x) (exprTy e) cur (if op == PostInc then "+" else "-")
     lift (store fn addr nv lt)
     pure cur -- the postfix value is the OLD one
   EAssign op l r -> genAssign e op l r
@@ -1017,10 +1050,8 @@ genUnary e op x = case op of
       fn <- gets lsFn
       addr <- genLvalueAddr x
       lt <- mtlcOf (exprTy x)
-      t <- mtlcOf (exprTy e)
       cur <- lift (load fn addr lt)
-      one <- lift (constInt fn t 1)
-      nv <- lift (binary fn o cur one t)
+      nv <- stepOne (exprTy x) (exprTy e) cur o
       lift (store fn addr nv lt)
       pure nv
 
@@ -1082,17 +1113,7 @@ genBinary e op l r
   where
     isCmp o = o `elem` [Eq, Ne, Lt, Le, Gt, Ge]
 
-    ptrOffset pv iv el o = do
-      fn <- gets lsFn
-      u64 <- u64L
-      esz <- max 1 <$> sizeOf el
-      scale <- lift (constInt fn u64 (fromIntegral esz))
-      i <- lift (cast fn iv u64)
-      off <- lift (binary fn "*" i scale u64)
-      p <- lift (cast fn pv u64)
-      sum' <- lift (binary fn o p off u64)
-      t <- mtlcOf (exprTy e)
-      lift (cast fn sum' t)
+    ptrOffset pv iv el o = ptrStep pv iv el o (exprTy e)
 
     ptrDiff lv rv el = do
       fn <- gets lsFn
@@ -1183,9 +1204,14 @@ genAssign e op lhs rhs
           rv <- genExpr rhs
           addr <- genLvalueAddr lhs
           lt <- mtlcOf (exprTy lhs)
-          t <- mtlcOf (exprTy e)
           cur <- lift (load fn addr lt)
-          nv <- lift (binary fn (binOpText bop) cur rv t)
+          nv <- case typeDecay (exprTy lhs) of
+            -- p += n / p -= n move by n elements, not n bytes
+            TPtr el | bop == Add || bop == Sub ->
+              ptrStep cur rv el (binOpText bop) (exprTy lhs)
+            _ -> do
+              t <- mtlcOf (exprTy e)
+              lift (binary fn (binOpText bop) cur rv t)
           lift (store fn addr nv lt)
           pure nv
       | otherwise = do

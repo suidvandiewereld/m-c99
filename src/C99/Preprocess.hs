@@ -4,6 +4,8 @@
 -- line markers so the lexer can attribute tokens to the header they came from.
 module C99.Preprocess
   ( PPOptions (..)
+  , PPCache
+  , newPPCache
   , defaultPPOptions
   , preprocess
   ) where
@@ -14,17 +16,36 @@ import Control.Monad.State.Strict
 import qualified Data.ByteString.Char8 as BS
 import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Char (digitToInt, isDigit, isHexDigit, isOctDigit, ord)
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate, isPrefixOf)
+import qualified Data.Map.Strict as M
 import System.Directory (doesFileExist)
 
 data PPOptions = PPOptions
   { ppIncludeDirs :: [FilePath]
   , ppDefines :: [(String, String)]
+  , -- | Share one cache (see 'newPPCache') across the translation units of a
+    -- run and every header is read and resolved once instead of once per TU.
+    -- 'Nothing' disables caching. A cache assumes the include dirs it serves
+    -- are fixed, so do not share one between differently-configured options.
+    ppCache :: Maybe PPCache
   }
 
 defaultPPOptions :: PPOptions
-defaultPPOptions = PPOptions {ppIncludeDirs = [], ppDefines = []}
+defaultPPOptions = PPOptions {ppIncludeDirs = [], ppDefines = [], ppCache = Nothing}
+
+-- | File contents and include resolutions, keyed for reuse across TUs.
+data PPCache = PPCache
+  { pcFiles :: IORef (M.Map FilePath (Maybe String))
+  , pcResolve :: IORef (M.Map (FilePath, Bool, String) (Maybe FilePath))
+  , -- | 'phase12' + 'physLines' output. A pure function of the file content,
+    -- so it can be shared across the many TUs that include the same header.
+    pcLines :: IORef (M.Map FilePath [String])
+  }
+
+newPPCache :: IO PPCache
+newPPCache = PPCache <$> newIORef M.empty <*> newIORef M.empty <*> newIORef M.empty
 
 -- ---- macro table ----
 
@@ -37,34 +58,31 @@ data Macro = Macro
   , mPredef :: !Bool
   }
 
-type Table = [Macro]
+-- | User definitions in one map, predefines in another, user shadowing predef
+-- on lookup. Header-sized macro tables are consulted for every identifier of
+-- every line, so this must not be a list.
+data Table = Table
+  { tabUser :: !(M.Map String Macro)
+  , tabPre :: !(M.Map String Macro)
+  }
+
+emptyTable :: Table
+emptyTable = Table M.empty M.empty
 
 macroFind :: Table -> String -> Maybe Macro
-macroFind tbl n = case filter ((== n) . mName) tbl of
-  (m : _) -> Just m
-  [] -> Nothing
+macroFind tbl n = case M.lookup n (tabUser tbl) of
+  hit@(Just _) -> hit
+  Nothing -> M.lookup n (tabPre tbl)
 
 -- | Redefining a predefined macro shadows it rather than overwriting it, so it
 -- survives a later @#undef@ (which likewise refuses to remove predefines).
 macroDefine :: Macro -> Table -> Table
-macroDefine m tbl = case break ((== mName m) . mName) tbl of
-  (pre, old : post)
-    | not (mPredef old) ->
-        pre
-          ++ old
-            { mFunc = mFunc m
-            , mVariadic = mVariadic m
-            , mParams = mParams m
-            , mBody = mBody m
-            }
-          : post
-  _ -> m : tbl
+macroDefine m tbl
+  | mPredef m = tbl {tabPre = M.insert (mName m) m (tabPre tbl)}
+  | otherwise = tbl {tabUser = M.insert (mName m) m (tabUser tbl)}
 
 macroUndef :: String -> Table -> Table
-macroUndef _ [] = []
-macroUndef n (m : ms)
-  | mName m == n && not (mPredef m) = ms
-  | otherwise = m : macroUndef n ms
+macroUndef n tbl = tbl {tabUser = M.delete n (tabUser tbl)}
 
 objMacro :: Bool -> String -> String -> Macro
 objMacro predef n body =
@@ -106,6 +124,8 @@ phase12 = go (0 :: Int)
       | Just rep <- trigraph c = rep : go pending r
     go pending ('\\' : '\n' : r) = go (pending + 1) r
     go pending ('\\' : '\r' : '\n' : r) = go (pending + 1) r
+    -- CRLF becomes LF here, so 'physLines' need not strip anything per line
+    go pending ('\r' : '\n' : r) = go pending ('\n' : r)
     go pending ('\n' : r) = '\n' : replicate pending '\n' ++ go 0 r
     go pending (c : r) = c : go pending r
     go pending [] = replicate pending '\n'
@@ -127,14 +147,10 @@ stripBom s
   | "\xEF\xBB\xBF" `isPrefixOf` s = drop 3 s
   | otherwise = s
 
--- | Physical lines with the trailing @\\r@ of a CRLF pair removed. A final
--- newline does not introduce a trailing empty line.
+-- | Physical lines. CRLF was already normalized to LF by 'phase12', and a
+-- final newline does not introduce a trailing empty line.
 physLines :: String -> [String]
-physLines = map dropCR . lines
-  where
-    dropCR l = case reverse l of
-      ('\r' : r) -> reverse r
-      _ -> l
+physLines = lines
 
 -- ---- #if expression evaluation ----
 
@@ -384,8 +400,24 @@ stringifyArg arg = '"' : concatMap esc arg ++ "\""
 -- | Expand one logical line. @startInComment@ says the line begins inside a
 -- block comment opened on an earlier line.
 expandLine :: Table -> FilePath -> Int -> String -> Bool -> String
-expandLine tbl path line input startInComment = prefix ++ go body
+expandLine tbl path line input startInComment
+  -- Comments, strings, and ordinary text pass through verbatim below, so when
+  -- no identifier of the line could expand, the whole function is the
+  -- identity: return the input unrebuilt. The candidate scan tokenizes the
+  -- way `go` does (including inside strings), so it can only over-approximate.
+  | not (anyCandidate input) = input
+  | otherwise = prefix ++ go body
   where
+    anyCandidate [] = False
+    anyCandidate s@(c : r)
+      | isIdentStart c =
+          let (i, r') = span isIdentCont s
+           in i == "__FILE__"
+                || i == "__LINE__"
+                || (case macroFind tbl i of Just _ -> True; Nothing -> False)
+                || anyCandidate r'
+      | otherwise = anyCandidate r
+
     (prefix, body)
       | startInComment = scanOpenComment input
       | otherwise = ("", input)
@@ -503,6 +535,47 @@ findInclude paths fromPath name angled =
       ok <- doesFileExist c
       if ok then return (Just c) else firstExisting cs
 
+-- | 'findInclude' / 'readFileBytes' through the cross-TU cache, when one is
+-- present. Headers are included by every TU; without this they are re-probed
+-- and re-read from disk once per unit.
+cachedResolve :: Maybe PPCache -> [FilePath] -> FilePath -> String -> Bool -> IO (Maybe FilePath)
+cachedResolve Nothing paths fromPath name angled = findInclude paths fromPath name angled
+cachedResolve (Just c) paths fromPath name angled = do
+  let key = (dirOf fromPath, angled, name)
+  m <- readIORef (pcResolve c)
+  case M.lookup key m of
+    Just hit -> return hit
+    Nothing -> do
+      r <- findInclude paths fromPath name angled
+      modifyIORef' (pcResolve c) (M.insert key r)
+      return r
+
+cachedPhysLines :: FilePath -> String -> PPM [String]
+cachedPhysLines path raw = do
+  mc <- gets stCache
+  case mc of
+    Nothing -> return fresh
+    Just c -> do
+      m <- liftIO (readIORef (pcLines c))
+      case M.lookup path m of
+        Just hit -> return hit
+        Nothing -> do
+          liftIO (modifyIORef' (pcLines c) (M.insert path fresh))
+          return fresh
+  where
+    fresh = physLines (phase12 (stripBom raw))
+
+cachedRead :: Maybe PPCache -> FilePath -> IO (Maybe String)
+cachedRead Nothing p = readFileBytes p
+cachedRead (Just c) p = do
+  m <- readIORef (pcFiles c)
+  case M.lookup p m of
+    Just hit -> return hit
+    Nothing -> do
+      r <- readFileBytes p
+      modifyIORef' (pcFiles c) (M.insert p r)
+      return r
+
 readFileBytes :: FilePath -> IO (Maybe String)
 readFileBytes p = do
   r <- try (BS.readFile p) :: IO (Either IOException BS.ByteString)
@@ -517,6 +590,7 @@ data St = St
   , stIncludeStack :: [FilePath]
   , stMsgs :: [Message] -- reversed
   , stPaths :: [FilePath]
+  , stCache :: Maybe PPCache
   }
 
 type PPM = StateT St IO
@@ -546,7 +620,7 @@ ppBuffer path raw = do
       return ""
     else do
       modify $ \s -> s {stIncludeStack = path : stIncludeStack s}
-      let src = physLines (phase12 (stripBom raw))
+      src <- cachedPhysLines path raw
       chunks <- ppLines path src 1 False [lineMarker 1 path]
       modify $ \s -> s {stIncludeStack = drop 1 (stIncludeStack s)}
       return (concat (reverse chunks))
@@ -723,13 +797,14 @@ doInclude path line rest acc = do
     Nothing -> ppError path line "bad #include" >> return (nl acc)
     Just (angled, name) -> do
       paths <- gets stPaths
-      found <- liftIO (findInclude paths path name angled)
+      cache <- gets stCache
+      found <- liftIO (cachedResolve cache paths path name angled)
       case found of
         Nothing -> do
           ppError path line ("cannot find include \"" ++ name ++ "\"")
           return (nl acc)
         Just fp -> do
-          msrc <- liftIO (readFileBytes fp)
+          msrc <- liftIO (cachedRead cache fp)
           case msrc of
             Nothing -> do
               ppError path line ("cannot read \"" ++ fp ++ "\"")
@@ -766,7 +841,7 @@ doLine path line rest acc = do
 -- ---- predefined macros ----
 
 predefs :: Table
-predefs = foldl' (flip macroDefine) [] (objs ++ fnNoops ++ objNoops ++ [popcount])
+predefs = foldl' (flip macroDefine) emptyTable (objs ++ fnNoops ++ objNoops ++ [popcount])
   where
     objs =
       [ objMacro True n v
@@ -816,7 +891,7 @@ predefs = foldl' (flip macroDefine) [] (objs ++ fnNoops ++ objNoops ++ [popcount
 -- diagnostics. Reads @#include@'d files from disk, hence IO.
 preprocess :: PPOptions -> FilePath -> IO (String, [Message])
 preprocess opts path = do
-  msrc <- readFileBytes path
+  msrc <- cachedRead (ppCache opts) path
   case msrc of
     Nothing -> return ("", [Message Error (SrcLoc path 1 1) "cannot read file"])
     Just src -> do
@@ -828,6 +903,7 @@ preprocess opts path = do
               , stIncludeStack = []
               , stMsgs = []
               , stPaths = ppIncludeDirs opts ++ ["include"]
+              , stCache = ppCache opts
               }
       (out, st) <- runStateT (ppBuffer path src) st0
       return (out, reverse (stMsgs st))

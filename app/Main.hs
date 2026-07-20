@@ -16,7 +16,7 @@ import C99.Ast (Program)
 import C99.Lexer (tokenize)
 import C99.Lower (lowerProgram)
 import C99.Parser (parseProgram)
-import C99.Preprocess (PPOptions (..), preprocess)
+import C99.Preprocess (PPOptions (..), newPPCache, preprocess)
 import C99.Runtime (u128RuntimeSrc)
 import C99.Sema (SemaResult (..), semaCheck)
 import C99.StaticRename (mangleStatics)
@@ -101,8 +101,16 @@ main = do
   opts <- parseArgs args defaults
   when (null (optInputs opts)) (usage >> exitFailure)
 
-  -- The builtin include dir (freestanding + CRT declarations) is searched last.
-  let ppopt = PPOptions {ppIncludeDirs = optIncludes opts ++ ["include"], ppDefines = []}
+  -- The builtin include dir (freestanding + CRT declarations) is searched
+  -- last. One cache for the whole run: every TU includes the same headers,
+  -- and this reads and resolves each of them once.
+  cache <- newPPCache
+  let ppopt =
+        PPOptions
+          { ppIncludeDirs = optIncludes opts ++ ["include"]
+          , ppDefines = []
+          , ppCache = Just cache
+          }
 
   if optPreprocessOnly opts
     then do
