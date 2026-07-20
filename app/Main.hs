@@ -364,10 +364,13 @@ foldMTU
   -> IO (Program, TypeContext, Bool, Bool)
 foldMTU f tc0 = go [] tc0 False False
   where
-    go acc tc saw bad [] = pure (acc, tc, saw, bad)
+    -- units accumulate in reverse and concatenate once: appending each
+    -- program to the merged tail re-copied everything already merged, which
+    -- is quadratic in the number of declarations.
+    go acc tc saw bad [] = pure (concat (reverse acc), tc, saw, bad)
     go acc tc saw bad ((i, path) : rest) = do
       (prog, tc', s, b) <- f i tc path
-      go (acc ++ prog) tc' (saw || s) (bad || b) rest
+      go (prog : acc) tc' (saw || s) (bad || b) rest
 
 -- | What to do with sema's findings when the parse did not fully succeed.
 --
