@@ -17,8 +17,11 @@ if not exist "%GHC%" if not "%GHC%"=="ghc" (
 if not exist bin mkdir bin
 if not exist build\hs mkdir build\hs
 
+rem -A128m: a bigger GC nursery. The frontend allocates at GB/s rates, and the
+rem default 4 MB arena spends ~40%% of the run collecting.
 echo Building bin\c99mtlc.exe ...
 %GHC% --make -O2 -Wall ^
+  -rtsopts "-with-rtsopts=-A128m" ^
   -isrc -iapp ^
   -outputdir build\hs ^
   -optc-Ilibmtlc\include ^

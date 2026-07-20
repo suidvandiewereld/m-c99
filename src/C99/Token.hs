@@ -7,6 +7,8 @@ module C99.Token
   , tokenKindName
   ) where
 
+import qualified Data.Map.Strict as M
+
 import C99.Common (SrcLoc, noLoc)
 
 data TokenKind
@@ -134,47 +136,53 @@ emptyToken =
     , tokFloatSuf = False
     }
 
--- | Keyword lookup; TkIdent when the spelling is not a keyword.
+-- | Keyword lookup; TkIdent when the spelling is not a keyword. The table is a
+-- shared Map: this runs for every identifier the lexer produces, so a chain of
+-- string comparisons is measurable.
 keywordKind :: String -> TokenKind
-keywordKind s = case s of
-  "auto" -> TkAuto
-  "break" -> TkBreak
-  "case" -> TkCase
-  "char" -> TkCharKw
-  "const" -> TkConst
-  "continue" -> TkContinue
-  "default" -> TkDefault
-  "do" -> TkDo
-  "double" -> TkDouble
-  "else" -> TkElse
-  "enum" -> TkEnum
-  "extern" -> TkExtern
-  "float" -> TkFloatKw
-  "for" -> TkFor
-  "goto" -> TkGoto
-  "if" -> TkIf
-  "inline" -> TkInline
-  "int" -> TkIntKw
-  "long" -> TkLong
-  "register" -> TkRegister
-  "restrict" -> TkRestrict
-  "return" -> TkReturn
-  "short" -> TkShort
-  "signed" -> TkSigned
-  "sizeof" -> TkSizeof
-  "static" -> TkStatic
-  "struct" -> TkStruct
-  "switch" -> TkSwitch
-  "typedef" -> TkTypedef
-  "union" -> TkUnion
-  "unsigned" -> TkUnsigned
-  "void" -> TkVoid
-  "volatile" -> TkVolatile
-  "while" -> TkWhile
-  "_Bool" -> TkBool
-  "_Complex" -> TkComplex
-  "__int128" -> TkInt128
-  _ -> TkIdent
+keywordKind s = M.findWithDefault TkIdent s keywordTable
+
+keywordTable :: M.Map String TokenKind
+keywordTable =
+  M.fromList
+    [ ("auto", TkAuto)
+    , ("break", TkBreak)
+    , ("case", TkCase)
+    , ("char", TkCharKw)
+    , ("const", TkConst)
+    , ("continue", TkContinue)
+    , ("default", TkDefault)
+    , ("do", TkDo)
+    , ("double", TkDouble)
+    , ("else", TkElse)
+    , ("enum", TkEnum)
+    , ("extern", TkExtern)
+    , ("float", TkFloatKw)
+    , ("for", TkFor)
+    , ("goto", TkGoto)
+    , ("if", TkIf)
+    , ("inline", TkInline)
+    , ("int", TkIntKw)
+    , ("long", TkLong)
+    , ("register", TkRegister)
+    , ("restrict", TkRestrict)
+    , ("return", TkReturn)
+    , ("short", TkShort)
+    , ("signed", TkSigned)
+    , ("sizeof", TkSizeof)
+    , ("static", TkStatic)
+    , ("struct", TkStruct)
+    , ("switch", TkSwitch)
+    , ("typedef", TkTypedef)
+    , ("union", TkUnion)
+    , ("unsigned", TkUnsigned)
+    , ("void", TkVoid)
+    , ("volatile", TkVolatile)
+    , ("while", TkWhile)
+    , ("_Bool", TkBool)
+    , ("_Complex", TkComplex)
+    , ("__int128", TkInt128)
+    ]
 
 -- | Human-readable spelling, for diagnostics.
 tokenKindName :: TokenKind -> String

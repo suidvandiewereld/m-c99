@@ -53,7 +53,7 @@ data LowerState = LowerState
     -- one yields the address, never a load through it.
     lsPtrs :: M.Map SymId Value
   , -- | Interned string literals: content -> name of its pointer global.
-    lsStrings :: [(String, String)]
+    lsStrings :: M.Map String String
   , -- | Pointer globals already lazily-initialized in the current function.
     -- Functions run in arbitrary order, so this must be per-function: relying
     -- on the module-wide first use leaves the pointer null in earlier callers.
@@ -88,7 +88,7 @@ lowerProgram sr = do
           , lsStrId = 0
           , lsLocals = M.empty
           , lsPtrs = M.empty
-          , lsStrings = []
+          , lsStrings = M.empty
           , lsFnStrEnsured = []
           , lsLoop = []
           , lsRetType = Nothing
@@ -427,7 +427,7 @@ genInit1 (IList _) = do
 genString :: String -> Lower Value
 genString s = do
   interned <- gets lsStrings
-  ptrname <- case lookup s interned of
+  ptrname <- case M.lookup s interned of
     Just p -> pure p
     Nothing -> newString s
   ensureString ptrname s
@@ -448,7 +448,7 @@ newString s = do
   p <- i8pL
   let ptrname = base ++ "_p"
   lift (builderGlobal b ptrname p 0 False)
-  modify' $ \st -> st {lsStrings = (s, ptrname) : lsStrings st}
+  modify' $ \st -> st {lsStrings = M.insert s ptrname (lsStrings st)}
   pure ptrname
   where
     chunk8 [] = []

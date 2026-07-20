@@ -72,13 +72,25 @@ err loc text = modify' $ \st ->
   st {lsMsgs = Message Error loc text : lsMsgs st}
 
 -- | Consume while the predicate holds, returning what was consumed.
+--
+-- One state write for the whole run — identifiers, numbers, whitespace and
+-- comment bodies all come through here, and going char-by-char through
+-- 'advance' costs a fresh state record per character.
 takeWhileL :: (Char -> Bool) -> Lex String
 takeWhileL p = do
-  c <- peekC
-  done <- atEnd
-  if not done && p c
-    then (c :) <$> (advance >> takeWhileL p)
-    else pure ""
+  st <- get
+  let (chunk, rest) = span p (lsRest st)
+      (line', col') = advanceLoc (lsLine st) (lsCol st) chunk
+  put st {lsRest = rest, lsLine = line', lsCol = col'}
+  pure chunk
+
+-- | Where the location ends up after consuming @chunk@.
+advanceLoc :: Int -> Int -> String -> (Int, Int)
+advanceLoc = go
+  where
+    go !l !c [] = (l, c)
+    go !l _ ('\n' : r) = go (l + 1) 1 r
+    go !l !c (_ : r) = go l (c + 1) r
 
 skipWhile :: (Char -> Bool) -> Lex ()
 skipWhile p = () <$ takeWhileL p
@@ -95,7 +107,8 @@ skipTrivia = do
       c2 <- peek2C
       case () of
         _
-          | c `elem` " \t\r\n\v\f" -> advance >> skipTrivia
+          | c `elem` " \t\r\n\v\f" ->
+              skipWhile (`elem` " \t\r\n\v\f") >> skipTrivia
           | c == '/' && c2 == '/' -> skipWhile (/= '\n') >> skipTrivia
           | c == '/' && c2 == '*' -> blockComment >> skipTrivia
           | c == '#' -> directive >> skipTrivia
@@ -109,15 +122,16 @@ blockComment = do
   go start
   where
     go start = do
+      skipWhile (/= '*')
       done <- atEnd
       if done
         then err start "unterminated block comment"
         else do
+          _ <- advance -- '*'
           c <- peekC
-          c2 <- peek2C
-          if c == '*' && c2 == '/'
-            then advance >> advance >> pure ()
-            else advance >> go start
+          if c == '/'
+            then () <$ advance
+            else go start
 
 -- | @# 42 "foo.h"@ (and @#line 42 "foo.h"@) resync the reported location.
 -- Any other residual directive is skipped to end of line.
