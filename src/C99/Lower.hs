@@ -1149,7 +1149,15 @@ genBinary e op l r
           | otherwise -> do
               -- libmtlc picks signed-vs-unsigned and int-vs-float comparison
               -- off the result type, so compare in the common operand type.
-              let ct
+              --
+              -- A shift is the exception. C99 6.5.7p3 promotes each operand on
+              -- its own and takes the result type from the LEFT one, so the
+              -- usual arithmetic conversions must not run: an unsigned count
+              -- would otherwise make the whole thing unsigned and turn an
+              -- arithmetic shift into a logical one.
+              let isShift = op == Shl || op == Shr
+                  ct
+                    | isShift = typePromote lt
                     | isCmp op =
                         if typeIsArithmetic lt && typeIsArithmetic rt
                           then typeUsualArith tc lt rt
@@ -1158,7 +1166,8 @@ genBinary e op l r
                         typeUsualArith tc lt rt
                     | otherwise = exprTy e
               lv' <- castTo lv lt ct
-              rv' <- castTo rv rt ct
+              -- the count keeps its own type; only its value matters
+              rv' <- if isShift then pure rv else castTo rv rt ct
               ct' <- mtlcOf ct
               res <- lift (binary fn (binOpText op) lv' rv' ct')
               if isCmp op && typeIsFloat ct

@@ -629,8 +629,13 @@ checkBinary e op l0 r0 = do
             BAnd -> arith
             BOr -> arith
             BXor -> arith
-            Shl -> arith
-            Shr -> arith
+            -- C99 6.5.7p3: each operand is promoted separately and the result
+            -- type is the promoted LEFT operand. Using the usual arithmetic
+            -- conversions here let an unsigned right operand make the result
+            -- unsigned, which turned `someInt >> someUnsigned` into a logical
+            -- shift and gave -8 >> 1u as 2147483644.
+            Shl -> typePromote lt
+            Shr -> typePromote lt
           -- complex arithmetic: the result is complex unless it is a comparison
           t' = case (lt, rt) of
             _
