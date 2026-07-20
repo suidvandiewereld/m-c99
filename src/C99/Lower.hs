@@ -1356,16 +1356,50 @@ genCall e f args = do
   case msym of
     Just sym -> genDirectCall e sym args
     Nothing -> do
-      -- an indirect call: a real code address in a value
+      -- An indirect call: a real code address in a value.
+      --
+      -- The callee's signature still decides the calling convention, so read
+      -- it off the pointer's type rather than ignoring it. Getting the
+      -- aggregate return wrong here was a segfault, not a wrong answer: the
+      -- callee wrote its result through a hidden pointer argument that was
+      -- never passed.
       fn <- gets lsFn
       fp <- genExpr f
-      argv <- mapM genExpr args
-      rt <- retTy (exprTy e)
-      lift (callIndirect fn fp argv rt)
+      let ft = case typeDecay (exprTy f) of
+            TPtr t@(TFunc {}) -> t
+            t@(TFunc {}) -> t
+            _ -> TFunc (exprTy e) [] False False
+          (fixed, retT) = case ft of
+            TFunc r ps _ _ -> (ps, r)
+            _ -> ([], exprTy e)
+          sret = isAgg retT && not (isArrayTy retT)
+      argv <- forM (zip [0 ..] args) $ \(i, a) -> do
+        v <- genExpr a
+        if i < length fixed && not (isAgg (fixed !! i))
+          then do
+            t <- mtlcOf (fixed !! i)
+            lift (cast fn v t)
+          else pure v
+      if sret
+        then do
+          sz <- sizeOf retT
+          buf <- stackBytes (max 1 sz) Nothing
+          memZero buf (max 1 sz)
+          p <- i8pL
+          _ <- lift (callIndirect fn fp (buf : argv) p)
+          pure buf
+        else do
+          rt <- retTy (exprTy e)
+          lift (callIndirect fn fp argv rt)
 
 retTy :: Type -> Lower Ty
 retTy TVoid = lift (tyScalar Void)
 retTy t = mtlcOf t
+
+-- | An array return type cannot happen in C, but a decayed one can reach here.
+isArrayTy :: Type -> Bool
+isArrayTy TArray {} = True
+isArrayTy _ = False
 
 genDirectCall :: Expr -> Symbol -> [Expr] -> Lower Value
 genDirectCall e sym args = do
@@ -1754,9 +1788,6 @@ genVarDecl d = case dSym d of
                 v' <- castTo v (exprTy x) ty
                 lift (assign fn loc v')
               Just ini -> genInitInto ty loc ini
-  where
-    isArrayTy TArray {} = True
-    isArrayTy _ = False
 
 -- ---- functions ----
 
@@ -1842,9 +1873,6 @@ genFunction fd = do
                 t <- mtlcOf retT
                 z <- lift (constInt fn t 0)
                 lift (ret fn z)
-  where
-    isArrayTy TArray {} = True
-    isArrayTy _ = False
 
 -- ---- globals and the module ----
 
