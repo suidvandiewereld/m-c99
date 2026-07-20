@@ -400,7 +400,16 @@ stringifyArg arg = '"' : concatMap esc arg ++ "\""
 -- | Expand one logical line. @startInComment@ says the line begins inside a
 -- block comment opened on an earlier line.
 expandLine :: Table -> FilePath -> Int -> String -> Bool -> String
-expandLine tbl path line input startInComment
+expandLine tbl path line input startInComment =
+  expandLine' [] tbl path line input startInComment
+
+-- | As 'expandLine', but carrying the names whose expansion we are inside.
+--
+-- C99 6.10.3.4p2: a macro name found while rescanning its own replacement is
+-- not replaced again. Without this @#define foo foo@ loops forever rather than
+-- terminating, and so does any mutually recursive pair.
+expandLine' :: [String] -> Table -> FilePath -> Int -> String -> Bool -> String
+expandLine' active tbl path line input startInComment
   -- Comments, strings, and ordinary text pass through verbatim below, so when
   -- no identifier of the line could expand, the whole function is the
   -- identity: return the input unrebuilt. The candidate scan tokenizes the
@@ -433,15 +442,17 @@ expandLine tbl path line input startInComment
 
     ident "__FILE__" r = '"' : map fwd path ++ '"' : go r
     ident "__LINE__" r = show line ++ go r
+    ident i r
+      | i `elem` active = i ++ go r -- painted blue: leave it alone forever
     ident i r = case macroFind tbl i of
       Nothing -> i ++ go r
       Just m
-        | not (mFunc m) -> substMacro tbl path line m [] ++ go r
+        | not (mFunc m) -> substMacro active tbl path line m [] ++ go r
         | otherwise ->
             case dropWhile isSpaceTab r of
               ('(' : r1) ->
                 let (args, r2) = scanArgs r1
-                 in substMacro tbl path line m args ++ go r2
+                 in substMacro active tbl path line m args ++ go r2
               _ -> i ++ go r
 
     fwd '\\' = '/'
@@ -473,10 +484,11 @@ scanArgs s0 = collect s0
 
     cons c (a, r) = (c : a, r)
 
--- | Substitute arguments into a macro body, then rescan the result.
-substMacro :: Table -> FilePath -> Int -> Macro -> [String] -> String
-substMacro tbl path line m args =
-  expandLine tbl path line (subst [] (mBody m)) False
+-- | Substitute arguments into a macro body, then rescan the result with this
+-- macro's own name held back, so the rescan cannot re-enter it.
+substMacro :: [String] -> Table -> FilePath -> Int -> Macro -> [String] -> String
+substMacro active tbl path line m args =
+  expandLine' (mName m : active) tbl path line (subst [] (mBody m)) False
   where
     nargs = length args
     fixed = length (mParams m)
