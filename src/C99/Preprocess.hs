@@ -10,7 +10,7 @@ module C99.Preprocess
   , preprocess
   ) where
 
-import C99.Common (Message (..), Severity (..), SrcLoc (..))
+import C99.Common (Message (..), Severity (..), SrcLoc (..), diag)
 import Control.Exception (IOException, try)
 import Control.Monad.State.Strict
 import qualified Data.ByteString.Char8 as BS
@@ -627,7 +627,7 @@ type PPM = StateT St IO
 
 ppError :: FilePath -> Int -> String -> PPM ()
 ppError path line text =
-  modify $ \s -> s {stMsgs = Message Error (SrcLoc path line 1) text : stMsgs s}
+  modify $ \s -> s {stMsgs = diag Error (SrcLoc path line 1) text : stMsgs s}
 
 -- | Output is suppressed unless every enclosing conditional is in its taken arm.
 recompute :: PPM ()
@@ -966,7 +966,7 @@ preprocess :: PPOptions -> FilePath -> IO (String, [Message])
 preprocess opts path = do
   msrc <- cachedRead (ppCache opts) path
   case msrc of
-    Nothing -> return ("", [Message Error (SrcLoc path 1 1) "cannot read file"])
+    Nothing -> return ("", [diag Error (SrcLoc path 1 1) "cannot read file"])
     Just src -> do
       let st0 =
             St

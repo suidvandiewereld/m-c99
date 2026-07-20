@@ -17,6 +17,8 @@ library
         C99.Ast
         C99.Common
         C99.CType
+        C99.Diag
+        C99.Explain
         C99.Lexer
         C99.Lower
         C99.Parser

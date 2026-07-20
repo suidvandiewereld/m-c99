@@ -116,7 +116,7 @@ lowerProgram sr = do
       pure m
 
 err :: SrcLoc -> String -> Lower ()
-err loc text = modify' $ \s -> s {lsMsgs = Message Error loc text : lsMsgs s}
+err loc text = modify' $ \s -> s {lsMsgs = diag Error loc text : lsMsgs s}
 
 -- ---- naming ----
 

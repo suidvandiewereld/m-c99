@@ -11,7 +11,7 @@ import Control.Monad (replicateM_, unless, void, when)
 import Control.Monad.State.Strict
 import Data.Char (chr, digitToInt, isDigit, isHexDigit, isOctDigit, ord)
 
-import C99.Common (Message (..), Severity (..), SrcLoc (..))
+import C99.Common (Message (..), Severity (..), SrcLoc (..), diag, withCode, withLabel, withLen)
 import C99.Token
 
 data LexState = LexState
@@ -32,10 +32,29 @@ tokenize path src =
    in (toks, reverse (lsMsgs st))
   where
     loop = do
-      t <- next
+      t <- measured next
       case tokKind t of
         TkEof -> pure [t]
         _ -> (t :) <$> loop
+
+-- | How wide the token is on the page, for the caret run under it.
+--
+-- Measured from the cursor rather than recorded at each of the ~90 places a
+-- token is built: the lexer already tracks line and column exactly, and the
+-- distance it moved is the token's width by definition. A token that spans
+-- lines (a multi-line string) underlines to the end of its first line, since
+-- the renderer draws one line.
+measured :: Lex Token -> Lex Token
+measured act = do
+  before <- get
+  t <- act
+  after <- get
+  let sameLine = lsLine after == lsLine before
+      n
+        | tokKind t == TkEof = 0
+        | sameLine = lsCol after - locCol (tokLoc t)
+        | otherwise = max 1 (length (takeWhile (/= '\n') (lsRest before)))
+  pure t {tokLen = max 0 n}
 
 -- ---- primitives ----
 
@@ -69,7 +88,17 @@ here = gets $ \st -> SrcLoc (lsFile st) (lsLine st) (lsCol st)
 
 err :: SrcLoc -> String -> Lex ()
 err loc text = modify' $ \st ->
-  st {lsMsgs = Message Error loc text : lsMsgs st}
+  st {lsMsgs = diag Error loc text : lsMsgs st}
+
+-- | An error with a span, a code and an inline label.
+errWith :: SrcLoc -> Int -> String -> String -> Maybe String -> Lex ()
+errWith loc n code text mlabel = modify' $ \st -> st {lsMsgs = m : lsMsgs st}
+  where
+    m =
+      maybe id withLabel mlabel $
+        withCode code $
+          withLen n $
+            diag Error loc text
 
 -- | Consume while the predicate holds, returning what was consumed.
 --
@@ -501,5 +530,14 @@ punct start = do
       | c2 == '=' -> tok2 TkGe
       | otherwise -> tok TkGt
     _ -> do
-      err start ("unexpected character '" ++ [c] ++ "'")
-      tok TkEof
+      -- Skip the character and carry on. Returning TkEof here ended the token
+      -- stream, so a single stray byte silently threw away the rest of the
+      -- translation unit and the parser then complained about whatever was
+      -- left dangling, miles from the real problem.
+      errWith
+        start
+        1
+        "E0001"
+        ("unexpected character '" ++ [c] ++ "' in source")
+        (Just "not part of any C token")
+      next

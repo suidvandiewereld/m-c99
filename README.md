@@ -12,6 +12,21 @@ powershell -File tests\run_suite.ps1
 Flags: `-o`, `-I`, `-E`, `-c`, `-O0`/`-O`, `--emit-ir`, `--static-prefix=`.
 `include/` is on the search path by default.
 
+Diagnostics: `-Wno-<group>`, `-Werror`, `-w`, `--max-errors=N`,
+`--error-format=json`, `--color=auto|always|never`, `--explain <CODE>`,
+`--help-warnings`. See [docs/diagnostics.md](docs/diagnostics.md).
+
+```
+error[E0102]: undeclared identifier 'coutner'
+  --> hello.c:6:12
+  |
+5 | int main(void) {
+6 |     return coutner + 1;
+  |            ^^^^^^^ not found in this scope
+7 | }
+   = help: did you mean 'counter'?
+```
+
 Building needs GHC (via [GHCup](https://www.haskell.org/ghcup/)). Every
 dependency is a GHC boot library, so `build.bat` uses `ghc --make` and needs no
 package index; `c99mtlc.cabal` is there for `cabal build` if you prefer it.
@@ -20,6 +35,9 @@ package index; `c99mtlc.cabal` is there for `cabal build` if you prefer it.
 
 | | |
 |---|---|
+| `src/C99/Common.hs` | source locations and the diagnostic type |
+| `src/C99/Diag.hs` | rendering: snippets, carets, colour, JSON, "did you mean" |
+| `src/C99/Explain.hs` | the error-code table behind `--explain` |
 | `src/C99/Preprocess.hs` | `#include`, macros, `#if`, and the `# n "file"` line markers the lexer resyncs on |
 | `src/C99/Lexer.hs` | tokens |
 | `src/C99/Parser.hs` | recursive descent; carries the typedef table the C grammar needs to stay unambiguous |

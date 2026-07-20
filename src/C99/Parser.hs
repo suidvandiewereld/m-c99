@@ -21,7 +21,7 @@ import Data.Maybe (fromMaybe, isNothing)
 
 import C99.Ast
 import C99.CType
-import C99.Common (Message (..), Severity (..), SrcLoc)
+import C99.Common (Message (..), Severity (..), SrcLoc, diag, withCode, withLabel, withLen)
 import C99.Token
 
 -- ---- state ----
@@ -113,13 +113,91 @@ expect k = do
   t <- cur
   if tokKind t == k
     then advance
-    else
-      perr
-        (tokLoc t)
+    else do
+      perrTok
+        t
+        "E0010"
         ("expected " ++ tokenKindName k ++ ", got " ++ tokenKindName (tokKind t))
+        (Just ("expected " ++ tokenKindName k ++ " here"))
+      -- Recover before returning. Leaving the offending token in place made
+      -- the caller retry on it and report again, so one missing ';' produced
+      -- an error for every token until the parser happened to land on a
+      -- declaration start.
+      synchronize
 
 perr :: SrcLoc -> String -> P ()
-perr loc text = modify' $ \s -> s {psMsgs = Message Error loc text : psMsgs s}
+perr loc text = modify' $ \s -> s {psMsgs = diag Error loc text : psMsgs s}
+
+-- | An error that underlines a whole token and carries a code.
+perrTok :: Token -> String -> String -> Maybe String -> P ()
+perrTok t code text mlabel = modify' $ \s -> s {psMsgs = m : psMsgs s}
+  where
+    m =
+      maybe id withLabel mlabel $
+        withCode code $
+          withLen (tokLen t) $
+            diag Error (tokLoc t) text
+
+-- | Panic-mode recovery: skip to something that plausibly starts a new
+-- construct, so the parser reports one error per mistake instead of one per
+-- token of the wreckage.
+--
+-- Stops /after/ a @;@ and /before/ a @}@ or a declaration keyword. A @{@ is
+-- also a stopping point: an unbalanced brace is better re-entered than
+-- swallowed whole. Bounded by TkEof, which 'advance' never consumes.
+synchronize :: P ()
+synchronize = go (0 :: Int)
+  where
+    go depth = do
+      k <- curKind
+      case () of
+        _
+          | k == TkEof -> pure ()
+          | k == TkSemi, depth <= 0 -> advance
+          | k == TkRBrace, depth <= 0 -> pure ()
+          | k == TkLBrace -> pure ()
+          | k `elem` syncStarters, depth <= 0 -> pure ()
+          | k == TkLParen -> advance >> go (depth + 1)
+          | k == TkRParen -> advance >> go (max 0 (depth - 1))
+          | otherwise -> advance >> go depth
+
+    -- The type keywords matter as much as the storage ones: without them,
+    -- recovery walks straight past the next `int foo(void)` and the caller
+    -- reports "expected a declaration" once per function to the end of the
+    -- file. Anything that can begin a declaration or a statement belongs here.
+    syncStarters =
+      [ TkTypedef
+      , TkExtern
+      , TkStatic
+      , TkInline
+      , TkVoid
+      , TkCharKw
+      , TkShort
+      , TkIntKw
+      , TkLong
+      , TkFloatKw
+      , TkDouble
+      , TkSigned
+      , TkUnsigned
+      , TkBool
+      , TkComplex
+      , TkInt128
+      , TkConst
+      , TkVolatile
+      , TkRestrict
+      , TkIf
+      , TkWhile
+      , TkFor
+      , TkDo
+      , TkSwitch
+      , TkReturn
+      , TkBreak
+      , TkContinue
+      , TkGoto
+      , TkStruct
+      , TkUnion
+      , TkEnum
+      ]
 
 -- ---- tables ----
 
@@ -226,9 +304,15 @@ parsePrimary = do
           expect TkRParen
           pure e
     _ -> do
-      perr loc "expected expression"
-      advance
+      t <- cur
+      perrTok t "E0011" "expected an expression" (Just "expected a value here")
+      -- Do not eat a token that closes the surrounding construct. Swallowing
+      -- the ';' of `int x = ;` left the caller's expect(';') looking at the
+      -- next line, which turned one mistake into two.
+      unless (tokKind t `elem` closers) advance
       pure (mkExpr loc (EInt 0 noSuffix))
+      where
+        closers = [TkSemi, TkRParen, TkRBrace, TkRBracket, TkComma, TkEof]
 
 parsePostfixExpr :: P Expr
 parsePostfixExpr = parsePrimary >>= go
@@ -1243,8 +1327,13 @@ topDecl = do
   loc <- curLoc
   if not (isT || k `elem` [TkTypedef, TkExtern, TkStatic, TkInline])
     then do
-      perr loc "expected declaration"
-      advance
+      t <- cur
+      perrTok
+        t
+        "E0012"
+        "expected a declaration"
+        (Just "only declarations may appear at file scope")
+      synchronize
       pure []
     else do
       (base, sc, _, es) <- parseDeclSpecs

@@ -112,6 +112,9 @@ data TokenKind
 data Token = Token
   { tokKind :: !TokenKind
   , tokLoc :: SrcLoc
+  , -- | Width on the page, for the caret run under a diagnostic. 0 when the
+    -- token has no extent (EOF).
+    tokLen :: !Int
   , tokText :: String
   , tokIVal :: !Integer
   , tokFVal :: !Double
@@ -127,6 +130,7 @@ emptyToken =
   Token
     { tokKind = TkEof
     , tokLoc = noLoc
+    , tokLen = 0
     , tokText = ""
     , tokIVal = 0
     , tokFVal = 0
