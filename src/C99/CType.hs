@@ -223,7 +223,16 @@ layout tc isUnion = go 0 1 0 Nothing []
               -- list: `int mix[KIND_COUNT];` where the bound is a sizeof
               -- expression the parse-time folder cannot evaluate lands here,
               -- and dropping it would make the member invisible to lookup.
-              then go off0 maxAlign maxSize Nothing (m {memOffset = 0} : acc) ms
+              --
+              -- It still needs a real offset. Leaving it at 0 put a flexible
+              -- array member on top of the first member of the struct, so
+              -- writing d[0] destroyed n in `struct { int n; int d[]; }`.
+              -- C99 6.7.2.1p16 places it where it would go if the array had
+              -- one element, while the struct's own size ignores it.
+              then
+                let ea = incompleteAlign tc mt
+                    o = alignUp off0 ea
+                 in go off0 (max ea maxAlign) maxSize Nothing (m {memOffset = o} : acc) ms
               else
                 let ma = typeAlign tc mt
                     ms' = typeSize tc mt
@@ -235,6 +244,17 @@ layout tc isUnion = go 0 1 0 Nothing []
                         let o = alignUp off0 ma
                             m' = m {memOffset = o}
                          in go (o + ms') (max ma maxAlign) maxSize Nothing (m' : acc) ms
+
+-- | The alignment an incomplete member wants.
+--
+-- For a flexible array member that is its element's alignment, which is what
+-- decides where the data actually starts. An incomplete type with no element
+-- to ask about falls back to 1, so it lands at the current offset rather than
+-- pushing anything around.
+incompleteAlign :: TypeContext -> Type -> Int
+incompleteAlign tc t = case t of
+  TArray el _ _ -> typeAlign tc el
+  _ -> 1
 
 alignUp :: Int -> Int -> Int
 alignUp x a

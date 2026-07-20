@@ -21,7 +21,7 @@ module C99.Lower
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.State.Strict
-import Data.Bits (complement, shiftL)
+import Data.Bits (bit, complement, shiftL)
 import Data.Char (ord)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust)
@@ -34,10 +34,19 @@ import C99.Sema (SemaResult (..), foldConst)
 import Mtlc
 
 -- | Every call to an extern variadic pads its tail to this arity, so all call
--- sites agree with the one module-level signature. Win64 varargs read argument
--- slots from memory, so the extra zero i64 arguments are harmless.
+-- sites agree with the one module-level signature that mtlc allows per name.
+--
+-- 16, not 32, and the difference is load-bearing: a call with 17 or more
+-- arguments overruns the caller's outgoing-argument area in the backend and
+-- overwrites its own spilled locals. Floating-point locals go first, so
+-- `double d = 3.75; printf("x"); (int)d` read 0 purely because the padding
+-- made an innocent one-argument printf into a 32-argument call.
+--
+-- The overrun is a backend bug and it is reachable without any padding at all,
+-- by writing a 17-argument call by hand. Keeping the pad under the threshold
+-- stops the frontend manufacturing it for every variadic call in the program.
 variadicPad :: Int
-variadicPad = 32
+variadicPad = 16
 
 data LowerState = LowerState
   { lsBuilder :: Builder
@@ -59,6 +68,11 @@ data LowerState = LowerState
     -- on the module-wide first use leaves the pointer null in earlier callers.
     lsFnStrEnsured :: [String]
   , lsLoop :: [(String, String)] -- (break label, continue label)
+  , -- | One entry per open switch, innermost first: the IR label for each case
+    -- value, and the default's label. A case label is emitted where it occurs
+    -- rather than collected from the top level of the body, so a case inside a
+    -- nested block or a loop is reachable.
+    lsSwitch :: [(M.Map Integer String, Maybe String)]
   , lsRetType :: Maybe Type
   , lsEmittedReturn :: !Bool
   , lsVaParam :: Maybe Value
@@ -91,6 +105,7 @@ lowerProgram sr = do
           , lsStrings = M.empty
           , lsFnStrEnsured = []
           , lsLoop = []
+          , lsSwitch = []
           , lsRetType = Nothing
           , lsEmittedReturn = False
           , lsVaParam = Nothing
@@ -393,6 +408,65 @@ isAddrGlobal :: Symbol -> Bool
 isAddrGlobal sym =
   symIsGlobal sym && (symAddrTaken sym || isAgg (symType sym))
 
+-- | How to reach an lvalue's storage.
+--
+-- A plain scalar global has no address to take: @mtlc_address_of@ is defined
+-- only for locals and parameters, which is why an addressable global is turned
+-- into a pointer global by the constructor in the first place. Such a global
+-- has to be read and written through its own handle.
+--
+-- Assignment already knew this and went through the handle. The
+-- read-modify-write sites did not: they asked 'genLvalueAddr' for an address,
+-- got the result of an unsupported @addressOf@, and loaded 0 through it. So
+-- @int g = 5; ++g@ yielded 1.
+data LvalRef
+  = -- | Read it as a value, write it with @assign@.
+    LvalHandle Value
+  | -- | Load and store through this address.
+    LvalAddr Value
+
+lvalRef :: Expr -> Lower LvalRef
+lvalRef e = case exNode e of
+  EIdent _ (Just sid) -> do
+    sym <- symOf sid
+    fn <- gets lsFn
+    if symIsGlobal sym && not (isAddrGlobal sym)
+      then LvalHandle <$> lift (globalRef fn (symLinkName sym))
+      else LvalAddr <$> genLvalueAddr e
+  _ -> LvalAddr <$> genLvalueAddr e
+
+readLval :: LvalRef -> Type -> Lower Value
+readLval (LvalHandle v) _ = pure v
+readLval (LvalAddr a) t = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  lift (load fn a ty)
+
+-- | Copy a value into a fresh temporary.
+--
+-- 'readLval' on a 'LvalHandle' hands back the storage itself, not a snapshot
+-- of it, so a later write through the same handle changes what the earlier
+-- read appears to say. @g++@ has to yield the value from before the increment,
+-- which means copying it out first. A load through an address is already a
+-- snapshot, but copying it too keeps the one rule instead of two.
+materialize :: Value -> Type -> Lower Value
+materialize v t = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  nm <- freshTmp "old"
+  tmp <- lift (local fn nm ty)
+  lift (assign fn tmp v)
+  pure tmp
+
+writeLval :: LvalRef -> Type -> Value -> Lower ()
+writeLval (LvalHandle h) _ v = do
+  fn <- gets lsFn
+  lift (assign fn h v)
+writeLval (LvalAddr a) t v = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  lift (store fn a v ty)
+
 -- | Allocate and zero an addressable global's storage if it is still null, then
 -- hand back the pointer global. Idempotent, so the constructor and any lazy use
 -- can both call it.
@@ -619,7 +693,23 @@ bfLoad addr m = do
   sh <- lift (constInt fn u32 (fromIntegral bitOff))
   shifted <- lift (binary fn ">>" word sh u32)
   mv <- lift (constInt fn u32 (fromIntegral (bfMask width)))
-  lift (binary fn "&" shifted mv u32)
+  raw <- lift (binary fn "&" shifted mv u32)
+  -- A bit-field declared with a signed type is a signed type (C99 6.7.2.1),
+  -- so its top bit is a sign bit. Masking alone leaves the value zero-extended,
+  -- and a 4-bit field holding -1 reads as 15.
+  --
+  -- Sign-extend with (v XOR s) - s, where s is the field's sign bit. The
+  -- textbook way is to shift the field up to the top of the word and back down
+  -- arithmetically, but a shift whose left operand is itself a shift currently
+  -- lowers to a logical shift, so this uses only XOR and subtract.
+  if width > 0 && width < 32 && not (typeIsUnsigned (memType m))
+    then do
+      i32 <- i32L
+      sv <- lift (cast fn raw i32)
+      s <- lift (constInt fn i32 (fromIntegral (bit (width - 1) :: Integer)))
+      flipped <- lift (binary fn "^" sv s i32)
+      lift (binary fn "-" flipped s i32)
+    else pure raw
 
 bfStore :: Value -> Member -> Value -> Lower ()
 bfStore addr m val = do
@@ -835,13 +925,12 @@ genExpr e = case exNode e of
   EBinary op l r -> genBinary e op l r
   EUnary op x -> genUnary e op x
   EPostfix op x -> do
-    fn <- gets lsFn
-    addr <- genLvalueAddr x
-    lt <- mtlcOf (exprTy x)
-    cur <- lift (load fn addr lt)
+    ref <- lvalRef x
+    cur <- readLval ref (exprTy x)
+    old <- materialize cur (exprTy x)
     nv <- stepOne (exprTy x) (exprTy e) cur (if op == PostInc then "+" else "-")
-    lift (store fn addr nv lt)
-    pure cur -- the postfix value is the OLD one
+    writeLval ref (exprTy x) nv
+    pure old -- the postfix value is the one from before the write
   EAssign op l r -> genAssign e op l r
   ECall f args _ -> genCall e f args
   EIndex base _ -> do
@@ -1047,12 +1136,10 @@ genUnary e op x = case op of
     lift (unary fn "!" v i32)
   where
     incDec o = do
-      fn <- gets lsFn
-      addr <- genLvalueAddr x
-      lt <- mtlcOf (exprTy x)
-      cur <- lift (load fn addr lt)
+      ref <- lvalRef x
+      cur <- readLval ref (exprTy x)
       nv <- stepOne (exprTy x) (exprTy e) cur o
-      lift (store fn addr nv lt)
+      writeLval ref (exprTy x) nv
       pure nv
 
 genBinary :: Expr -> BinOp -> Expr -> Expr -> Lower Value
@@ -1093,7 +1180,15 @@ genBinary e op l r
           | otherwise -> do
               -- libmtlc picks signed-vs-unsigned and int-vs-float comparison
               -- off the result type, so compare in the common operand type.
-              let ct
+              --
+              -- A shift is the exception. C99 6.5.7p3 promotes each operand on
+              -- its own and takes the result type from the LEFT one, so the
+              -- usual arithmetic conversions must not run: an unsigned count
+              -- would otherwise make the whole thing unsigned and turn an
+              -- arithmetic shift into a logical one.
+              let isShift = op == Shl || op == Shr
+                  ct
+                    | isShift = typePromote lt
                     | isCmp op =
                         if typeIsArithmetic lt && typeIsArithmetic rt
                           then typeUsualArith tc lt rt
@@ -1102,7 +1197,14 @@ genBinary e op l r
                         typeUsualArith tc lt rt
                     | otherwise = exprTy e
               lv' <- castTo lv lt ct
-              rv' <- castTo rv rt ct
+              -- A signed right shift whose left operand is a computed temporary
+              -- (`(x << 28) >> 28`) used to need that operand copied into a
+              -- named local, because the backend only sign-extended a narrow
+              -- value on the way into a name, not into a temporary. libmtlc now
+              -- canonicalizes narrow temporaries at their definition (issue #13),
+              -- so the extra local is no longer needed.
+              -- the count keeps its own type; only its value matters
+              rv' <- if isShift then pure rv else castTo rv rt ct
               ct' <- mtlcOf ct
               res <- lift (binary fn (binOpText op) lv' rv' ct')
               if isCmp op && typeIsFloat ct
@@ -1202,9 +1304,8 @@ genAssign e op lhs rhs
       | AssignOp bop <- op = do
           fn <- gets lsFn
           rv <- genExpr rhs
-          addr <- genLvalueAddr lhs
-          lt <- mtlcOf (exprTy lhs)
-          cur <- lift (load fn addr lt)
+          ref <- lvalRef lhs
+          cur <- readLval ref (exprTy lhs)
           nv <- case typeDecay (exprTy lhs) of
             -- p += n / p -= n move by n elements, not n bytes
             TPtr el | bop == Add || bop == Sub ->
@@ -1212,7 +1313,7 @@ genAssign e op lhs rhs
             _ -> do
               t <- mtlcOf (exprTy e)
               lift (binary fn (binOpText bop) cur rv t)
-          lift (store fn addr nv lt)
+          writeLval ref (exprTy lhs) nv
           pure nv
       | otherwise = do
           fn <- gets lsFn
@@ -1270,16 +1371,50 @@ genCall e f args = do
   case msym of
     Just sym -> genDirectCall e sym args
     Nothing -> do
-      -- an indirect call: a real code address in a value
+      -- An indirect call: a real code address in a value.
+      --
+      -- The callee's signature still decides the calling convention, so read
+      -- it off the pointer's type rather than ignoring it. Getting the
+      -- aggregate return wrong here was a segfault, not a wrong answer: the
+      -- callee wrote its result through a hidden pointer argument that was
+      -- never passed.
       fn <- gets lsFn
       fp <- genExpr f
-      argv <- mapM genExpr args
-      rt <- retTy (exprTy e)
-      lift (callIndirect fn fp argv rt)
+      let ft = case typeDecay (exprTy f) of
+            TPtr t@(TFunc {}) -> t
+            t@(TFunc {}) -> t
+            _ -> TFunc (exprTy e) [] False False
+          (fixed, retT) = case ft of
+            TFunc r ps _ _ -> (ps, r)
+            _ -> ([], exprTy e)
+          sret = isAgg retT && not (isArrayTy retT)
+      argv <- forM (zip [0 ..] args) $ \(i, a) -> do
+        v <- genExpr a
+        if i < length fixed && not (isAgg (fixed !! i))
+          then do
+            t <- mtlcOf (fixed !! i)
+            lift (cast fn v t)
+          else pure v
+      if sret
+        then do
+          sz <- sizeOf retT
+          buf <- stackBytes (max 1 sz) Nothing
+          memZero buf (max 1 sz)
+          p <- i8pL
+          _ <- lift (callIndirect fn fp (buf : argv) p)
+          pure buf
+        else do
+          rt <- retTy (exprTy e)
+          lift (callIndirect fn fp argv rt)
 
 retTy :: Type -> Lower Ty
 retTy TVoid = lift (tyScalar Void)
 retTy t = mtlcOf t
+
+-- | An array return type cannot happen in C, but a decayed one can reach here.
+isArrayTy :: Type -> Bool
+isArrayTy TArray {} = True
+isArrayTy _ = False
 
 genDirectCall :: Expr -> Symbol -> [Expr] -> Lower Value
 genDirectCall e sym args = do
@@ -1493,8 +1628,12 @@ genStmt st = do
               lift (ret fn v')
         modify' (\s -> s {lsEmittedReturn = True})
       SSwitch c b -> genSwitch c b
-      SCase _ b -> genStmt b
-      SDefault b -> genStmt b
+      SCase v b -> do
+        emitCaseLabel (fromMaybe 0 (foldConst v))
+        genStmt b
+      SDefault b -> do
+        emitDefaultLabel
+        genStmt b
       SGoto l -> do
         fn <- gets lsFn
         lift (jump fn (".G" ++ l))
@@ -1514,9 +1653,10 @@ genBlockItem (BIDecl ds) = mapM_ genVarDecl ds
 
 -- | A switch: compare-and-jump dispatch, then the body with fall-through.
 --
--- The parser nests @case A: case B: stmt@ as CASE(A, CASE(B, stmt)), so the
--- label chain is flattened first and every label made a peer pointing at the
--- same statement index.
+-- Labels are collected from anywhere in the body and emitted where they occur,
+-- so a @case@ inside a nested block, an @if@ or a loop is reachable. Collecting
+-- only the top level of the body made those silently unreachable, which is what
+-- broke Duff's device: its labels live inside a @do@/@while@.
 genSwitch :: Expr -> Stmt -> Lower ()
 genSwitch cond body = do
   fn <- gets lsFn
@@ -1524,43 +1664,28 @@ genSwitch cond body = do
   end <- freshLabel "swend"
   i32 <- i32L
 
-  let raw = case stNode body of
-        SCompound items -> [s | BIStmt s <- items]
-        _ -> [body]
-      flat = zip [0 :: Int ..] (map unwrapLabels raw)
-      -- (value, statement index) for each case, and the default's index
-      cases =
-        [ (v, i)
-        | (i, (labels, _)) <- flat
-        , CaseLabel v <- labels
-        ]
-      defaults = [i | (i, (labels, _)) <- flat, DefaultLabel <- labels]
-
-  caseLabels <- mapM (const (freshLabel "case")) cases
-  defLabel <- if null defaults then pure Nothing else Just <$> freshLabel "default"
+  let (values, hasDefault) = switchLabelsOf body
+  named <- forM values $ \v -> (,) v <$> freshLabel "case"
+  defLabel <- if hasDefault then Just <$> freshLabel "default" else pure Nothing
 
   -- dispatch
-  forM_ (zip caseLabels cases) $ \(lbl, (v, _)) -> do
+  forM_ named $ \(v, lbl) -> do
     k <- lift (constInt fn i32 v)
     eq <- lift (binary fn "==" cv k i32)
     next <- freshLabel "swn"
     lift (branchIfZero fn eq next)
     lift (jump fn lbl)
     lift (label fn next)
-  case defLabel of
-    Just dl -> lift (jump fn dl)
-    Nothing -> lift (jump fn end)
+  lift (jump fn (fromMaybe end defLabel))
 
-  -- body, with fall-through between cases
-  modify' (\s -> s {lsLoop = (end, contOf s) : lsLoop s})
-  forM_ flat $ \(i, (_, stmt)) -> do
-    forM_ (zip caseLabels cases) $ \(lbl, (_, ci)) ->
-      when (ci == i) $ lift (label fn lbl)
-    case defLabel of
-      Just dl | i `elem` defaults -> lift (label fn dl)
-      _ -> pure ()
-    mapM_ genStmt stmt
-  modify' (\s -> s {lsLoop = drop 1 (lsLoop s)})
+  -- body: SCase and SDefault emit their own labels from this table
+  modify' $ \s ->
+    s
+      { lsLoop = (end, contOf s) : lsLoop s
+      , lsSwitch = (M.fromList named, defLabel) : lsSwitch s
+      }
+  genStmt body
+  modify' $ \s -> s {lsLoop = drop 1 (lsLoop s), lsSwitch = drop 1 (lsSwitch s)}
   lift (label fn end)
   where
     -- a switch is a break target but not a continue target: continue keeps
@@ -1569,20 +1694,45 @@ genSwitch cond body = do
       ((_, c) : _) -> c
       [] -> ".Lswend_unreachable"
 
-data SwitchLabel = CaseLabel Integer | DefaultLabel
-  deriving (Eq)
+-- | Emit the label for a case value, from the innermost open switch.
+emitCaseLabel :: Integer -> Lower ()
+emitCaseLabel v = do
+  st <- gets lsSwitch
+  fn <- gets lsFn
+  case st of
+    ((tbl, _) : _) | Just lbl <- M.lookup v tbl -> lift (label fn lbl)
+    _ -> pure () -- a case outside any switch; sema already reported it
 
--- | Peel the leading case/default chain off a statement, returning its labels
--- and the statement they guard (Nothing for an empty case).
-unwrapLabels :: Stmt -> ([SwitchLabel], Maybe Stmt)
-unwrapLabels s = case stNode s of
-  SCase v b ->
-    let (ls, inner) = unwrapLabels b
-     in (CaseLabel (fromMaybe 0 (foldConst v)) : ls, inner)
-  SDefault b ->
-    let (ls, inner) = unwrapLabels b
-     in (DefaultLabel : ls, inner)
-  _ -> ([], Just s)
+emitDefaultLabel :: Lower ()
+emitDefaultLabel = do
+  st <- gets lsSwitch
+  fn <- gets lsFn
+  case st of
+    ((_, Just lbl) : _) -> lift (label fn lbl)
+    _ -> pure ()
+
+-- | Every case value in this switch, and whether it has a default.
+--
+-- Does not descend into a nested switch, whose labels belong to it.
+switchLabelsOf :: Stmt -> ([Integer], Bool)
+switchLabelsOf = go
+  where
+    go s = case stNode s of
+      SCase v b -> let (vs, d) = go b in (fromMaybe 0 (foldConst v) : vs, d)
+      SDefault b -> let (vs, _) = go b in (vs, True)
+      SSwitch {} -> ([], False)
+      SCompound items -> mconcatPairs (map item items)
+      SIf _ a mb -> mconcatPairs (go a : maybe [] ((: []) . go) mb)
+      SWhile _ b -> go b
+      SDo b _ -> go b
+      SFor _ _ _ b -> go b
+      SLabel _ b -> go b
+      _ -> ([], False)
+
+    item (BIStmt x) = go x
+    item (BIDecl _) = ([], False)
+
+    mconcatPairs ps = (concatMap fst ps, or (map snd ps))
 
 -- ---- local declarations ----
 
@@ -1653,9 +1803,6 @@ genVarDecl d = case dSym d of
                 v' <- castTo v (exprTy x) ty
                 lift (assign fn loc v')
               Just ini -> genInitInto ty loc ini
-  where
-    isArrayTy TArray {} = True
-    isArrayTy _ = False
 
 -- ---- functions ----
 
@@ -1741,9 +1888,6 @@ genFunction fd = do
                 t <- mtlcOf retT
                 z <- lift (constInt fn t 0)
                 lift (ret fn z)
-  where
-    isArrayTy TArray {} = True
-    isArrayTy _ = False
 
 -- ---- globals and the module ----
 
