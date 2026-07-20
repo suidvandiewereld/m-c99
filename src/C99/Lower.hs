@@ -59,6 +59,11 @@ data LowerState = LowerState
     -- on the module-wide first use leaves the pointer null in earlier callers.
     lsFnStrEnsured :: [String]
   , lsLoop :: [(String, String)] -- (break label, continue label)
+  , -- | One entry per open switch, innermost first: the IR label for each case
+    -- value, and the default's label. A case label is emitted where it occurs
+    -- rather than collected from the top level of the body, so a case inside a
+    -- nested block or a loop is reachable.
+    lsSwitch :: [(M.Map Integer String, Maybe String)]
   , lsRetType :: Maybe Type
   , lsEmittedReturn :: !Bool
   , lsVaParam :: Maybe Value
@@ -91,6 +96,7 @@ lowerProgram sr = do
           , lsStrings = M.empty
           , lsFnStrEnsured = []
           , lsLoop = []
+          , lsSwitch = []
           , lsRetType = Nothing
           , lsEmittedReturn = False
           , lsVaParam = Nothing
@@ -1573,8 +1579,12 @@ genStmt st = do
               lift (ret fn v')
         modify' (\s -> s {lsEmittedReturn = True})
       SSwitch c b -> genSwitch c b
-      SCase _ b -> genStmt b
-      SDefault b -> genStmt b
+      SCase v b -> do
+        emitCaseLabel (fromMaybe 0 (foldConst v))
+        genStmt b
+      SDefault b -> do
+        emitDefaultLabel
+        genStmt b
       SGoto l -> do
         fn <- gets lsFn
         lift (jump fn (".G" ++ l))
@@ -1594,9 +1604,10 @@ genBlockItem (BIDecl ds) = mapM_ genVarDecl ds
 
 -- | A switch: compare-and-jump dispatch, then the body with fall-through.
 --
--- The parser nests @case A: case B: stmt@ as CASE(A, CASE(B, stmt)), so the
--- label chain is flattened first and every label made a peer pointing at the
--- same statement index.
+-- Labels are collected from anywhere in the body and emitted where they occur,
+-- so a @case@ inside a nested block, an @if@ or a loop is reachable. Collecting
+-- only the top level of the body made those silently unreachable, which is what
+-- broke Duff's device: its labels live inside a @do@/@while@.
 genSwitch :: Expr -> Stmt -> Lower ()
 genSwitch cond body = do
   fn <- gets lsFn
@@ -1604,43 +1615,28 @@ genSwitch cond body = do
   end <- freshLabel "swend"
   i32 <- i32L
 
-  let raw = case stNode body of
-        SCompound items -> [s | BIStmt s <- items]
-        _ -> [body]
-      flat = zip [0 :: Int ..] (map unwrapLabels raw)
-      -- (value, statement index) for each case, and the default's index
-      cases =
-        [ (v, i)
-        | (i, (labels, _)) <- flat
-        , CaseLabel v <- labels
-        ]
-      defaults = [i | (i, (labels, _)) <- flat, DefaultLabel <- labels]
-
-  caseLabels <- mapM (const (freshLabel "case")) cases
-  defLabel <- if null defaults then pure Nothing else Just <$> freshLabel "default"
+  let (values, hasDefault) = switchLabelsOf body
+  named <- forM values $ \v -> (,) v <$> freshLabel "case"
+  defLabel <- if hasDefault then Just <$> freshLabel "default" else pure Nothing
 
   -- dispatch
-  forM_ (zip caseLabels cases) $ \(lbl, (v, _)) -> do
+  forM_ named $ \(v, lbl) -> do
     k <- lift (constInt fn i32 v)
     eq <- lift (binary fn "==" cv k i32)
     next <- freshLabel "swn"
     lift (branchIfZero fn eq next)
     lift (jump fn lbl)
     lift (label fn next)
-  case defLabel of
-    Just dl -> lift (jump fn dl)
-    Nothing -> lift (jump fn end)
+  lift (jump fn (fromMaybe end defLabel))
 
-  -- body, with fall-through between cases
-  modify' (\s -> s {lsLoop = (end, contOf s) : lsLoop s})
-  forM_ flat $ \(i, (_, stmt)) -> do
-    forM_ (zip caseLabels cases) $ \(lbl, (_, ci)) ->
-      when (ci == i) $ lift (label fn lbl)
-    case defLabel of
-      Just dl | i `elem` defaults -> lift (label fn dl)
-      _ -> pure ()
-    mapM_ genStmt stmt
-  modify' (\s -> s {lsLoop = drop 1 (lsLoop s)})
+  -- body: SCase and SDefault emit their own labels from this table
+  modify' $ \s ->
+    s
+      { lsLoop = (end, contOf s) : lsLoop s
+      , lsSwitch = (M.fromList named, defLabel) : lsSwitch s
+      }
+  genStmt body
+  modify' $ \s -> s {lsLoop = drop 1 (lsLoop s), lsSwitch = drop 1 (lsSwitch s)}
   lift (label fn end)
   where
     -- a switch is a break target but not a continue target: continue keeps
@@ -1649,20 +1645,45 @@ genSwitch cond body = do
       ((_, c) : _) -> c
       [] -> ".Lswend_unreachable"
 
-data SwitchLabel = CaseLabel Integer | DefaultLabel
-  deriving (Eq)
+-- | Emit the label for a case value, from the innermost open switch.
+emitCaseLabel :: Integer -> Lower ()
+emitCaseLabel v = do
+  st <- gets lsSwitch
+  fn <- gets lsFn
+  case st of
+    ((tbl, _) : _) | Just lbl <- M.lookup v tbl -> lift (label fn lbl)
+    _ -> pure () -- a case outside any switch; sema already reported it
 
--- | Peel the leading case/default chain off a statement, returning its labels
--- and the statement they guard (Nothing for an empty case).
-unwrapLabels :: Stmt -> ([SwitchLabel], Maybe Stmt)
-unwrapLabels s = case stNode s of
-  SCase v b ->
-    let (ls, inner) = unwrapLabels b
-     in (CaseLabel (fromMaybe 0 (foldConst v)) : ls, inner)
-  SDefault b ->
-    let (ls, inner) = unwrapLabels b
-     in (DefaultLabel : ls, inner)
-  _ -> ([], Just s)
+emitDefaultLabel :: Lower ()
+emitDefaultLabel = do
+  st <- gets lsSwitch
+  fn <- gets lsFn
+  case st of
+    ((_, Just lbl) : _) -> lift (label fn lbl)
+    _ -> pure ()
+
+-- | Every case value in this switch, and whether it has a default.
+--
+-- Does not descend into a nested switch, whose labels belong to it.
+switchLabelsOf :: Stmt -> ([Integer], Bool)
+switchLabelsOf = go
+  where
+    go s = case stNode s of
+      SCase v b -> let (vs, d) = go b in (fromMaybe 0 (foldConst v) : vs, d)
+      SDefault b -> let (vs, _) = go b in (vs, True)
+      SSwitch {} -> ([], False)
+      SCompound items -> mconcatPairs (map item items)
+      SIf _ a mb -> mconcatPairs (go a : maybe [] ((: []) . go) mb)
+      SWhile _ b -> go b
+      SDo b _ -> go b
+      SFor _ _ _ b -> go b
+      SLabel _ b -> go b
+      _ -> ([], False)
+
+    item (BIStmt x) = go x
+    item (BIDecl _) = ([], False)
+
+    mconcatPairs ps = (concatMap fst ps, or (map snd ps))
 
 -- ---- local declarations ----
 
