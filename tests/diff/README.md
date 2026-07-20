@@ -17,23 +17,22 @@ with gcc).
 
 ## Current state
 
-Seven of these fail. They are checked in deliberately: each one is a real,
-reproduced miscompile, and the file is the smallest program that shows it.
+Two of these fail, and both are checked in deliberately: each is a real,
+reproduced miscompile and the file is the smallest program that shows it.
 
-| File | What is wrong |
-|---|---|
-| `global_incdec.c` | `++`/`--` on a scalar global yields a value computed from 0 |
-| `bitfield_signed.c` | a signed bit-field is not sign-extended on read |
-| `shift_mixed.c` | `int >> unsigned` becomes a logical shift |
-| `switch_nested_case.c` | a `case` inside a nested block is unreachable |
-| `flexible_array.c` | a flexible array member aliases the member before it |
-| `fptr_struct.c` | calling a function pointer that returns a struct crashes |
-| `vararg_cast.c` | an int derived from a float cast is passed as raw float bits |
+| File | What is wrong | Issue |
+|---|---|---|
+| `shift_nested.c` | a shift whose left operand is itself a shift becomes logical | #13 |
+| `many_args.c` | a call with many arguments clobbers the caller's floating-point locals | #14 |
 
-The other sixteen pass, which is the useful half of that number: struct copies,
-recursion, designated initializers, compound literals, unions, multidimensional
-arrays, goto out of nested loops, unsigned division, integer promotions and
-`va_arg` are all correct.
+Both were found while fixing others, which is the argument for keeping a
+corpus rather than a checklist.
+
+The other twenty-two pass, including the seven that were failing when this
+directory was created: `++`/`--` on a scalar global, signed bit-fields,
+`int >> unsigned`, a `case` in a nested block (and Duff's device), flexible
+array members, a function pointer returning a struct, and a variadic call
+destroying a `double`.
 
 ## Adding a case
 
