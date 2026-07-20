@@ -14,12 +14,14 @@ import C99.Common (Message (..), Severity (..), SrcLoc (..), diag)
 import Control.Exception (IOException, try)
 import Control.Monad.State.Strict
 import qualified Data.ByteString.Char8 as BS
+import Data.ByteString.Char8 (ByteString)
 import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Char (digitToInt, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate, isPrefixOf)
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import System.Directory (doesFileExist)
 
 data PPOptions = PPOptions
@@ -37,11 +39,12 @@ defaultPPOptions = PPOptions {ppIncludeDirs = [], ppDefines = [], ppCache = Noth
 
 -- | File contents and include resolutions, keyed for reuse across TUs.
 data PPCache = PPCache
-  { pcFiles :: IORef (M.Map FilePath (Maybe String))
+  { pcFiles :: IORef (M.Map FilePath (Maybe ByteString))
   , pcResolve :: IORef (M.Map (FilePath, Bool, String) (Maybe FilePath))
-  , -- | 'phase12' + 'physLines' output. A pure function of the file content,
-    -- so it can be shared across the many TUs that include the same header.
-    pcLines :: IORef (M.Map FilePath [String])
+  , -- | 'physLinesBS' output. A pure function of the file content, so it can
+    -- be shared across the many TUs that include the same header. The lines
+    -- are slices into one buffer per file, not copies.
+    pcLines :: IORef (M.Map FilePath [ByteString])
   }
 
 newPPCache :: IO PPCache
@@ -64,10 +67,16 @@ data Macro = Macro
 data Table = Table
   { tabUser :: !(M.Map String Macro)
   , tabPre :: !(M.Map String Macro)
+  , -- | Every name that might expand, as bytes, for the per-line candidate
+    -- scan: it answers "could this identifier be a macro?" on a zero-copy
+    -- slice, without unpacking a String key for the Map. Over-approximate on
+    -- purpose: @#undef@ leaves the name in (a stale hit just sends one line
+    -- down the exact slow path), and __FILE__/__LINE__ are in from the start.
+    tabNames :: !(S.Set ByteString)
   }
 
 emptyTable :: Table
-emptyTable = Table M.empty M.empty
+emptyTable = Table M.empty M.empty (S.fromList [BS.pack "__FILE__", BS.pack "__LINE__"])
 
 macroFind :: Table -> String -> Maybe Macro
 macroFind tbl n = case M.lookup n (tabUser tbl) of
@@ -78,8 +87,10 @@ macroFind tbl n = case M.lookup n (tabUser tbl) of
 -- survives a later @#undef@ (which likewise refuses to remove predefines).
 macroDefine :: Macro -> Table -> Table
 macroDefine m tbl
-  | mPredef m = tbl {tabPre = M.insert (mName m) m (tabPre tbl)}
-  | otherwise = tbl {tabUser = M.insert (mName m) m (tabUser tbl)}
+  | mPredef m = tbl' {tabPre = M.insert (mName m) m (tabPre tbl)}
+  | otherwise = tbl' {tabUser = M.insert (mName m) m (tabUser tbl)}
+  where
+    tbl' = tbl {tabNames = S.insert (BS.pack (mName m)) (tabNames tbl)}
 
 macroUndef :: String -> Table -> Table
 macroUndef n tbl = tbl {tabUser = M.delete n (tabUser tbl)}
@@ -142,15 +153,42 @@ phase12 = go (0 :: Int)
       '-' -> Just '~'
       _ -> Nothing
 
-stripBom :: String -> String
+stripBom :: ByteString -> ByteString
 stripBom s
-  | "\xEF\xBB\xBF" `isPrefixOf` s = drop 3 s
+  | BS.pack "\xEF\xBB\xBF" `BS.isPrefixOf` s = BS.drop 3 s
   | otherwise = s
 
--- | Physical lines. CRLF was already normalized to LF by 'phase12', and a
--- final newline does not introduce a trailing empty line.
-physLines :: String -> [String]
-physLines = lines
+-- | Physical lines of a raw buffer, as zero-copy slices.
+--
+-- Nearly no real file uses trigraphs or line splices, so when neither can
+-- occur the buffer is split in place and each line keeps pointing into it;
+-- a trailing @\\r@ is sliced off per line, which is all the CRLF handling
+-- 'phase12' did. Only a file that could actually need phases 1-2 pays for
+-- the String round trip through 'phase12'.
+physLinesBS :: ByteString -> [ByteString]
+physLinesBS raw
+  | needsPhase12 raw = BS.lines (BS.pack (phase12 (BS.unpack raw)))
+  | otherwise = map stripCR (BS.lines raw)
+  where
+    stripCR l
+      | not (BS.null l), BS.last l == '\r' = BS.init l
+      | otherwise = l
+
+-- | Could 'phase12' change this buffer (beyond CRLF)? A trigraph needs @??@,
+-- a splice needs a backslash immediately before the line end.
+needsPhase12 :: ByteString -> Bool
+needsPhase12 raw = BS.pack "??" `BS.isInfixOf` raw || go 0
+  where
+    go from = case BS.elemIndex '\\' (BS.drop from raw) of
+      Nothing -> False
+      Just i ->
+        let k = from + i + 1
+         in ( k < BS.length raw
+                && (BS.index raw k == '\n' || BS.index raw k == '\r')
+            )
+              -- resume AT k, not k+1: in a run of backslashes the next one
+              -- starts exactly at k, and skipping it would miss "\\\\\n"
+              || go k
 
 -- ---- #if expression evaluation ----
 
@@ -387,23 +425,34 @@ scanOpenComment [] = ("", [])
 -- | Paren depth of one physical line, ignoring strings, chars and comments.
 -- Returns the updated depth, the block-comment state to carry to the next line,
 -- and the offset of a @//@ comment if one starts on this line.
-lineParenDepth :: String -> Int -> Bool -> (Int, Bool, Maybe Int)
-lineParenDepth s depth0 inC0 = go (0 :: Int) s depth0 inC0
+--
+-- An index loop over the bytes: this runs on every line of every file, so it
+-- must not allocate. The literal skip mirrors 'scanLit' (backslash guards the
+-- next byte; an unterminated literal consumes the rest of the line).
+lineParenDepth :: ByteString -> Int -> Bool -> (Int, Bool, Maybe Int)
+lineParenDepth s depth0 inC0 = go 0 depth0 inC0
   where
-    go k str d True = case str of
-      ('*' : '/' : r) -> go (k + 2) r d False
-      (_ : r) -> go (k + 1) r d True
-      [] -> (d, True, Nothing)
-    go k str d False = case str of
-      ('/' : '/' : _) -> (d, False, Just k)
-      ('/' : '*' : r) -> go (k + 2) r d True
-      (q : r)
-        | q == '"' || q == '\'' ->
-            let (lit, r') = scanLit q r in go (k + 1 + length lit) r' d False
-      ('(' : r) -> go (k + 1) r (d + 1) False
-      (')' : r) -> go (k + 1) r (d - 1) False
-      (_ : r) -> go (k + 1) r d False
-      [] -> (d, False, Nothing)
+    n = BS.length s
+    at i = BS.index s i
+    go !k !d True
+      | k >= n = (d, True, Nothing)
+      | at k == '*', k + 1 < n, at (k + 1) == '/' = go (k + 2) d False
+      | otherwise = go (k + 1) d True
+    go !k !d False
+      | k >= n = (d, False, Nothing)
+      | c == '/', k + 1 < n, at (k + 1) == '/' = (d, False, Just k)
+      | c == '/', k + 1 < n, at (k + 1) == '*' = go (k + 2) d True
+      | c == '"' || c == '\'' = go (lit (k + 1) c) d False
+      | c == '(' = go (k + 1) (d + 1) False
+      | c == ')' = go (k + 1) (d - 1) False
+      | otherwise = go (k + 1) d False
+      where
+        c = at k
+    lit !k q
+      | k >= n = k
+      | at k == '\\' = lit (k + 2) q
+      | at k == q = k + 1
+      | otherwise = lit (k + 1) q
 
 -- ---- expansion ----
 
@@ -580,7 +629,7 @@ cachedResolve (Just c) paths fromPath name angled = do
       modifyIORef' (pcResolve c) (M.insert key r)
       return r
 
-cachedPhysLines :: FilePath -> String -> PPM [String]
+cachedPhysLines :: FilePath -> ByteString -> PPM [ByteString]
 cachedPhysLines path raw = do
   mc <- gets stCache
   case mc of
@@ -593,9 +642,9 @@ cachedPhysLines path raw = do
           liftIO (modifyIORef' (pcLines c) (M.insert path fresh))
           return fresh
   where
-    fresh = physLines (phase12 (stripBom raw))
+    fresh = physLinesBS (stripBom raw)
 
-cachedRead :: Maybe PPCache -> FilePath -> IO (Maybe String)
+cachedRead :: Maybe PPCache -> FilePath -> IO (Maybe ByteString)
 cachedRead Nothing p = readFileBytes p
 cachedRead (Just c) p = do
   m <- readIORef (pcFiles c)
@@ -606,10 +655,10 @@ cachedRead (Just c) p = do
       modifyIORef' (pcFiles c) (M.insert p r)
       return r
 
-readFileBytes :: FilePath -> IO (Maybe String)
+readFileBytes :: FilePath -> IO (Maybe ByteString)
 readFileBytes p = do
   r <- try (BS.readFile p) :: IO (Either IOException BS.ByteString)
-  return (either (const Nothing) (Just . BS.unpack) r)
+  return (either (const Nothing) Just r)
 
 -- ---- driver state ----
 
@@ -633,67 +682,105 @@ ppError path line text =
 recompute :: PPM ()
 recompute = modify $ \s -> s {stDisabled = any (/= 1) (stIfStack s)}
 
-lineMarker :: Int -> FilePath -> String
-lineMarker line path = "# " ++ show line ++ " \"" ++ map fwd path ++ "\"\n"
+-- | A single newline chunk. The preprocessor emits blank lines constantly to
+-- keep physical line numbering, so this shared 'ByteString' saves packing one
+-- for every splice and every disabled line.
+nlB :: ByteString
+nlB = BS.singleton '\n'
+
+lineMarker :: Int -> FilePath -> ByteString
+lineMarker line path = BS.pack ("# " ++ show line ++ " \"" ++ map fwd path ++ "\"\n")
   where
     fwd '\\' = '/'
     fwd c = c
 
 -- ---- one buffer ----
 
-ppBuffer :: FilePath -> String -> PPM String
+ppBuffer :: FilePath -> ByteString -> PPM ByteString
 ppBuffer path raw = do
   stack <- gets stIncludeStack
   if path `elem` stack
     then do
       ppError path 1 "include cycle"
-      return ""
+      return BS.empty
     else do
       modify $ \s -> s {stIncludeStack = path : stIncludeStack s}
       src <- cachedPhysLines path raw
       chunks <- ppLines path src 1 False [lineMarker 1 path]
       modify $ \s -> s {stIncludeStack = drop 1 (stIncludeStack s)}
-      return (concat (reverse chunks))
+      return (BS.concat (reverse chunks))
 
--- | @acc@ holds the emitted chunks in reverse order.
-ppLines :: FilePath -> [String] -> Int -> Bool -> [String] -> PPM [String]
+-- | @acc@ holds the emitted chunks in reverse order. Each chunk is a
+-- 'ByteString', so the whole translation unit is assembled with a single
+-- 'BS.concat' at the end rather than materializing a @[Char]@ list that the
+-- lexer would immediately pack straight back into bytes.
+--
+-- The common case takes the fast path: a line that opens no invocation to
+-- merge and names no macro cannot change under expansion, so the original
+-- slice is emitted as-is, no unpack, no rebuild, no repack. Only a line that
+-- might mean something to the macro engine pays for the String machinery.
+ppLines :: FilePath -> [ByteString] -> Int -> Bool -> [ByteString] -> PPM [ByteString]
 ppLines _ [] _ _ acc = return acc
 ppLines path (raw : rest) line inCmt acc
-  | not inCmt, ('#' : _) <- dropWhile isSpaceTab raw = do
-      acc' <- directive path raw line acc
+  | not inCmt, startsHashBS raw = do
+      acc' <- directive path (BS.unpack raw) line acc
       ppLines path rest (line + 1) inCmt acc'
   | otherwise = do
       dis <- gets stDisabled
       if dis
-        then ppLines path rest (line + 1) inCmt ("\n" : acc)
+        then ppLines path rest (line + 1) inCmt (nlB : acc)
         else do
           tbl <- gets stMacros
           let (d0, cmt1, cmtAt) = lineParenDepth raw 0 inCmt
-              logical0
-                | d0 > 0, Just k <- cmtAt = take k raw
-                | otherwise = raw
-              (logical, merged, inCmt', rest') = mergeLines d0 cmt1 logical0 rest 0
-              expanded = expandLine tbl path line logical inCmt
-              acc' = "\n" : replicate merged "\n" ++ (expanded : acc)
-          ppLines path rest' (line + merged + 1) inCmt' acc'
+          if not inCmt && d0 <= 0 && not (anyCandidateBS tbl raw)
+            then ppLines path rest (line + 1) cmt1 (nlB : raw : acc)
+            else do
+              let logical0
+                    | d0 > 0, Just k <- cmtAt = BS.take k raw
+                    | otherwise = raw
+                  (logical, merged, inCmt', rest') =
+                    mergeLines d0 cmt1 (BS.unpack logical0) rest 0
+                  expanded = expandLine tbl path line logical inCmt
+                  acc' = nlB : replicate merged nlB ++ (BS.pack expanded : acc)
+              ppLines path rest' (line + merged + 1) inCmt' acc'
+
+startsHashBS :: ByteString -> Bool
+startsHashBS s =
+  let t = BS.dropWhile isSpaceTab s
+   in not (BS.null t) && BS.head t == '#'
+
+-- | Could expansion change this line? True iff some identifier on it is a
+-- known macro name (or __FILE__/__LINE__, which live in 'tabNames' too). Scans
+-- byte slices in place; over-approximates exactly like the String candidate
+-- scan in 'expandLine'' (it also looks inside strings and comments).
+anyCandidateBS :: Table -> ByteString -> Bool
+anyCandidateBS tbl s = go 0
+  where
+    n = BS.length s
+    names = tabNames tbl
+    go !i
+      | i >= n = False
+      | isIdentStart (BS.index s i) =
+          let j = end (i + 1)
+           in S.member (BS.take (j - i) (BS.drop i s)) names || go j
+      | otherwise = go (i + 1)
+    end !j
+      | j < n && isIdentCont (BS.index s j) = end (j + 1)
+      | otherwise = j
 
 -- | A function-like invocation may span physical lines: while the line leaves
 -- @(@ unbalanced, absorb following lines (directives stop the merge). Blank
 -- lines are emitted afterwards to keep the line count.
-mergeLines :: Int -> Bool -> String -> [String] -> Int -> (String, Int, Bool, [String])
+mergeLines :: Int -> Bool -> String -> [ByteString] -> Int -> (String, Int, Bool, [ByteString])
 mergeLines depth inC logical ls merged
   | depth > 0
   , merged < 512
   , (nraw : rest) <- ls
-  , not (startsHash nraw) =
+  , not (startsHashBS nraw) =
       let (d', inC', ncmt) = lineParenDepth nraw depth inC
-          nraw' = maybe nraw (`take` nraw) ncmt
-       in mergeLines d' inC' (logical ++ " " ++ nraw') rest (merged + 1)
+          nraw' = maybe nraw (`BS.take` nraw) ncmt
+       in mergeLines d' inC' (logical ++ " " ++ BS.unpack nraw') rest (merged + 1)
   | otherwise = (logical, merged, inC, ls)
-  where
-    startsHash s = case dropWhile isSpaceTab s of
-      ('#' : _) -> True
-      _ -> False
 
 -- ---- directives ----
 
@@ -737,7 +824,7 @@ resolveDefined tbl = go
             Nothing -> False
        in (if found then "1" else "0") ++ go r3
 
-directive :: FilePath -> String -> Int -> [String] -> PPM [String]
+directive :: FilePath -> String -> Int -> [ByteString] -> PPM [ByteString]
 directive path raw line acc = do
   let afterHash = dropWhile isSpaceTab (drop 1 (dropWhile isSpaceTab raw))
       (dir, s2) = readIdent afterHash
@@ -806,7 +893,7 @@ directive path raw line acc = do
           Just "line" -> doLine path line rest acc
           _ -> return (nl acc)
   where
-    nl a = "\n" : a
+    nl a = nlB : a
     flipTop t
       | t == 1 = 2
       | t == 0 = 1
@@ -859,7 +946,7 @@ doDefine path line rest0 = case readIdent rest of
       (')' : r) -> r
       r -> r
 
-doInclude :: FilePath -> Int -> String -> [String] -> PPM [String]
+doInclude :: FilePath -> Int -> String -> [ByteString] -> PPM [ByteString]
 doInclude path line rest acc = do
   tbl <- gets stMacros
   let target = case rest of
@@ -885,20 +972,20 @@ doInclude path line rest acc = do
             Just src -> do
               incOut <- ppBuffer fp src
               let acc1 = incOut : acc
-                  acc2 = if lastCharIsNL acc1 then acc1 else "\n" : acc1
+                  acc2 = if lastCharIsNL acc1 then acc1 else nlB : acc1
               return (lineMarker (line + 1) path : acc2)
   where
-    nl a = "\n" : a
+    nl a = nlB : a
     parseName ('"' : r) = Just (False, takeWhile (/= '"') r)
     parseName ('<' : r) = Just (True, takeWhile (/= '>') r)
     parseName _ = Nothing
 
-lastCharIsNL :: [String] -> Bool
-lastCharIsNL cs = case filter (not . null) cs of
-  (c : _) -> last c == '\n'
+lastCharIsNL :: [ByteString] -> Bool
+lastCharIsNL cs = case filter (not . BS.null) cs of
+  (c : _) -> BS.last c == '\n'
   [] -> False
 
-doLine :: FilePath -> Int -> String -> [String] -> PPM [String]
+doLine :: FilePath -> Int -> String -> [ByteString] -> PPM [ByteString]
 doLine path line rest acc = do
   tbl <- gets stMacros
   let e0 = dropWhile isSpaceTab (expandLine tbl path line rest False)
@@ -909,7 +996,7 @@ doLine path line rest acc = do
         _ -> path
   if newLine > 0
     then return (lineMarker newLine newFile : acc)
-    else return ("\n" : acc)
+    else return (nlB : acc)
 
 -- ---- predefined macros ----
 
@@ -962,11 +1049,11 @@ predefs = foldl' (flip macroDefine) emptyTable (objs ++ fnNoops ++ objNoops ++ [
 
 -- | Preprocess the file at the given path. Returns the expanded text and any
 -- diagnostics. Reads @#include@'d files from disk, hence IO.
-preprocess :: PPOptions -> FilePath -> IO (String, [Message])
+preprocess :: PPOptions -> FilePath -> IO (ByteString, [Message])
 preprocess opts path = do
   msrc <- cachedRead (ppCache opts) path
   case msrc of
-    Nothing -> return ("", [diag Error (SrcLoc path 1 1) "cannot read file"])
+    Nothing -> return (BS.empty, [diag Error (SrcLoc path 1 1) "cannot read file"])
     Just src -> do
       let st0 =
             St

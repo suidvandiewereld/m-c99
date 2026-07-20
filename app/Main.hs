@@ -5,6 +5,7 @@
 module Main (main) where
 
 import Control.Monad (forM, unless, when)
+import qualified Data.ByteString.Char8 as BS
 import Data.List (isPrefixOf)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
@@ -237,7 +238,7 @@ main = do
       oks <- forM (optInputs opts) $ \path -> do
         (text, msgs) <- preprocess ppopt path
         sinkReport sink msgs
-        if hasErrors msgs then pure False else putStr text >> pure True
+        if hasErrors msgs then pure False else BS.putStr text >> pure True
       unless (and oks) $ do
         finish sink (optInputs opts)
     else compile sink opts ppopt
@@ -295,7 +296,7 @@ compile sink opts ppopt = do
     if not sawI128
       then pure (merged, tc1)
       else do
-        let (toks, lexMsgs) = tokenize "<c99m-u128-runtime>" u128RuntimeSrc
+        let (toks, lexMsgs) = tokenize "<c99m-u128-runtime>" (BS.pack u128RuntimeSrc)
             (rprog, tc', _, pMsgs) = parseProgram tc1 toks
         sinkReport sink (lexMsgs ++ pMsgs)
         if hasErrors (lexMsgs ++ pMsgs)
@@ -363,10 +364,13 @@ foldMTU
   -> IO (Program, TypeContext, Bool, Bool)
 foldMTU f tc0 = go [] tc0 False False
   where
-    go acc tc saw bad [] = pure (acc, tc, saw, bad)
+    -- units accumulate in reverse and concatenate once: appending each
+    -- program to the merged tail re-copied everything already merged, which
+    -- is quadratic in the number of declarations.
+    go acc tc saw bad [] = pure (concat (reverse acc), tc, saw, bad)
     go acc tc saw bad ((i, path) : rest) = do
       (prog, tc', s, b) <- f i tc path
-      go (acc ++ prog) tc' (saw || s) (bad || b) rest
+      go (prog : acc) tc' (saw || s) (bad || b) rest
 
 -- | What to do with sema's findings when the parse did not fully succeed.
 --
