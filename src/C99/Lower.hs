@@ -34,10 +34,19 @@ import C99.Sema (SemaResult (..), foldConst)
 import Mtlc
 
 -- | Every call to an extern variadic pads its tail to this arity, so all call
--- sites agree with the one module-level signature. Win64 varargs read argument
--- slots from memory, so the extra zero i64 arguments are harmless.
+-- sites agree with the one module-level signature that mtlc allows per name.
+--
+-- 16, not 32, and the difference is load-bearing: a call with 17 or more
+-- arguments overruns the caller's outgoing-argument area in the backend and
+-- overwrites its own spilled locals. Floating-point locals go first, so
+-- `double d = 3.75; printf("x"); (int)d` read 0 purely because the padding
+-- made an innocent one-argument printf into a 32-argument call.
+--
+-- The overrun is a backend bug and it is reachable without any padding at all,
+-- by writing a 17-argument call by hand. Keeping the pad under the threshold
+-- stops the frontend manufacturing it for every variadic call in the program.
 variadicPad :: Int
-variadicPad = 32
+variadicPad = 16
 
 data LowerState = LowerState
   { lsBuilder :: Builder
