@@ -543,7 +543,13 @@ checkExpr e = case exNode e of
     pure (setTy (typeOf r'') e {exNode = EComma l' r''})
   ECompoundLit ty i -> do
     i' <- checkInit i
-    pure (setTy ty e {exNode = ECompoundLit ty i'})
+    -- an unsized array literal takes its bound from the initializer, or it
+    -- would be laid out as zero bytes and every element past the first would
+    -- land outside its storage
+    let ty' = case ty of
+          TArray b 0 vla | Just n <- initArrayLen i' -> TArray b (max 1 n) vla
+          _ -> ty
+    pure (setTy ty' e {exNode = ECompoundLit ty' i'})
   EBuiltin name args mty -> do
     args' <- mapM checkExpr args
     let t
@@ -980,18 +986,21 @@ checkBlockItem (BIDecl ds) = BIDecl <$> mapM (checkDecl False) ds
 inferArrayLen :: Decl -> Decl
 inferArrayLen d = case (dType d, dInit d) of
   (TArray b 0 vla, Just ini)
-    | Just n <- lenOf ini -> d {dType = TArray b (max 1 n) vla}
+    | Just n <- initArrayLen ini -> d {dType = TArray b (max 1 n) vla}
   _ -> d
+
+-- | The element count an initializer implies for an unsized array.
+initArrayLen :: Init -> Maybe Int
+initArrayLen (IExpr x) | EString s <- exNode x = Just (length s + 1)
+initArrayLen (IList items) = Just (foldl' step 0 (zip [0 ..] items))
   where
-    lenOf (IExpr x) | EString s <- exNode x = Just (length s + 1)
-    lenOf (IList items) = Just (foldl' step 0 (zip [0 ..] items))
-    lenOf _ = Nothing
     -- a designated [k] = ... resets the running index, as in C
     step n (seqIdx, (mdes, _)) =
       let idx = case mdes of
             Just (DIndex ix) | Just k <- foldConst ix -> fromIntegral k
             _ -> seqIdx
        in max n (idx + 1)
+initArrayLen _ = Nothing
 
 checkDecl :: Bool -> Decl -> Sema Decl
 checkDecl isGlobal d0 = case dStorage d0 of
