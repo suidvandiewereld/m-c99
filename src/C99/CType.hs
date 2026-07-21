@@ -23,6 +23,7 @@ module C99.CType
   , tagInfo
   , tagLookup
   , tagDeclare
+  , tagDeclareFresh
   , tagSetMembers
     -- * Layout
   , typeSize
@@ -141,7 +142,16 @@ tagDeclare k mname tc
   | Just name <- mname
   , Just tid <- tagLookup tc k name =
       (tid, tc)
-  | otherwise =
+  | otherwise = tagDeclareFresh k mname tc
+
+-- | Introduce a tag under a new id even when the name is already taken.
+--
+-- The parser uses this for a definition that shadows an outer tag: tag names
+-- are scoped, so @struct T { int y; }@ inside a block must not overwrite the
+-- @struct T@ the enclosing scope defined. The name now maps to the new id;
+-- types already built from the old id keep their members.
+tagDeclareFresh :: TagKind -> Maybe String -> TypeContext -> (TagId, TypeContext)
+tagDeclareFresh k mname tc =
       let tid = tcNextTag tc
           info =
             TagInfo

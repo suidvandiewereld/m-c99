@@ -33,6 +33,10 @@ data PState = PState
   , psTc :: TypeContext
   , psTypedefs :: M.Map String Type
   , psEnums :: M.Map String Integer
+  , -- | Tag names in scope, innermost block first. A tag declared in a block
+    -- is visible only there, so an inner @struct T { int y; }@ shadows an
+    -- outer @struct T@ instead of overwriting its members.
+    psTagScopes :: [M.Map (TagKind, String) TagId]
   , psMsgs :: [Message] -- reversed
   , psSawInt128 :: !Bool
   , -- | Whether the declarator being parsed wants the bound of a VLA reported,
@@ -59,6 +63,7 @@ parseProgram tc toks =
           , psTc = tc
           , psTypedefs = M.empty
           , psEnums = M.empty
+          , psTagScopes = [M.empty]
           , psMsgs = []
           , psSawInt128 = False
           , psVlaOn = False
@@ -216,12 +221,54 @@ registerEnum name v = modify' $ \s -> s {psEnums = M.insert name v (psEnums s)}
 lookupEnum :: String -> P (Maybe Integer)
 lookupEnum name = gets (M.lookup name . psEnums)
 
-declareTag :: TagKind -> Maybe String -> P TagId
-declareTag k mname = do
-  tc <- gets psTc
-  let (tid, tc') = tagDeclare k mname tc
-  modify' $ \s -> s {psTc = tc'}
-  pure tid
+-- | Run a parser in a fresh tag scope, then drop it.
+withTagScope :: P a -> P a
+withTagScope p = do
+  modify' $ \s -> s {psTagScopes = M.empty : psTagScopes s}
+  a <- p
+  modify' $ \s -> s {psTagScopes = drop 1 (psTagScopes s)}
+  pure a
+
+-- | Introduce or look up a tag. @defining@ says a @{ ... }@ body follows.
+--
+-- A definition binds the name in the innermost scope: it completes a tag only
+-- when that same scope already forward-declared one (@struct T; struct T {};@),
+-- and otherwise starts a new tag. A bare reference searches outward, so
+-- @struct node *next;@ inside @struct node@ still names the enclosing tag.
+declareTag :: TagKind -> Maybe String -> Bool -> P TagId
+declareTag k mname defining = do
+  scopes <- gets psTagScopes
+  case mname of
+    Nothing -> fresh
+    Just name
+      | defining -> case M.lookup (k, name) (headScope scopes) of
+          Just tid -> do
+            tc <- gets psTc
+            if tagIncomplete (tagInfo tc tid) then pure tid else fresh
+          Nothing -> fresh
+      | otherwise -> case lookupOut (k, name) scopes of
+          Just tid -> pure tid
+          Nothing -> fresh
+  where
+    headScope (m : _) = m
+    headScope [] = M.empty
+
+    lookupOut _ [] = Nothing
+    lookupOut key (m : ms) = case M.lookup key m of
+      Just tid -> Just tid
+      Nothing -> lookupOut key ms
+
+    fresh = do
+      tc <- gets psTc
+      let (tid, tc') = tagDeclareFresh k mname tc
+      modify' $ \s ->
+        s
+          { psTc = tc'
+          , psTagScopes = case (mname, psTagScopes s) of
+              (Just name, m : ms) -> M.insert (k, name) tid m : ms
+              _ -> psTagScopes s
+          }
+      pure tid
 
 setMembers :: TagId -> [Member] -> P ()
 setMembers tid ms = modify' $ \s -> s {psTc = tagSetMembers tid ms (psTc s)}
@@ -647,7 +694,10 @@ parseStructOrUnion isUnion = do
   advance -- struct / union
   mtag <- optIdentName
   let kind = if isUnion then KUnion else KStruct
-  tid <- declareTag kind mtag
+  -- the tag has to be bound before the body is parsed, so a member can refer
+  -- back to it; whether a body follows decides which scope binds it
+  defining <- (== TkLBrace) <$> curKind
+  tid <- declareTag kind mtag defining
   brace <- match TkLBrace
   when brace $ do
     ms <- memberLoop []
@@ -709,7 +759,8 @@ parseEnum :: P (Type, [(String, Integer)])
 parseEnum = do
   advance -- enum
   mtag <- optIdentName
-  tid <- declareTag KEnum mtag
+  defining <- (== TkLBrace) <$> curKind
+  tid <- declareTag KEnum mtag defining
   brace <- match TkLBrace
   if not brace
     then pure (TEnum tid, [])
@@ -741,7 +792,7 @@ u128Type = do
   case tagLookup tc KStruct u128Name of
     Just tid | not (tagIncomplete (tagInfo tc tid)) -> pure (TStruct tid)
     _ -> do
-      tid <- declareTag KStruct (Just u128Name)
+      tid <- declareTag KStruct (Just u128Name) True
       setMembers
         tid
         [ Member (Just "lo") TULLong 0 Nothing
@@ -1071,7 +1122,7 @@ parseInitializer = do
 -- ---- statements ----
 
 parseCompound :: P Stmt
-parseCompound = do
+parseCompound = withTagScope $ do
   loc <- curLoc
   expect TkLBrace
   items <- loop []
