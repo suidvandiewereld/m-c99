@@ -1318,8 +1318,21 @@ genAssign e op lhs rhs
             TPtr el | bop == Add || bop == Sub ->
               ptrStep cur rv el (binOpText bop) (exprTy lhs)
             _ -> do
-              t <- mtlcOf (exprTy e)
-              lift (binary fn (binOpText bop) cur rv t)
+              -- E1 op= E2 computes E1 op E2 at the usual-arithmetic type,
+              -- then converts back (C99 6.5.16.2p3). `float f; f += 0.5;`
+              -- must add in double, or it rounds twice.
+              tc <- gets lsTc
+              let lt = exprTy lhs
+                  rt = exprTy rhs
+                  ct
+                    | typeIsArithmetic lt && typeIsArithmetic rt =
+                        typeUsualArith tc lt rt
+                    | otherwise = exprTy e
+              cur' <- castTo cur lt ct
+              rv' <- castTo rv rt ct
+              t <- mtlcOf ct
+              res <- lift (binary fn (binOpText bop) cur' rv' t)
+              castTo res ct (exprTy e)
           writeLval ref (exprTy lhs) nv
           pure nv
       | otherwise = do
