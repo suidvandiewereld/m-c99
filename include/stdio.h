@@ -1,4 +1,5 @@
-/* C99 <stdio.h> — declarations; definitions come from the host CRT at link. */
+/* C99 <stdio.h> — declarations; the definitions are c99rt (rt/), the
+ * compiler's own runtime, linked into every executable. */
 #ifndef _STDIO_H
 #define _STDIO_H
 
@@ -8,11 +9,11 @@
 typedef struct _C99MTLC_FILE FILE;
 typedef long long fpos_t;
 
-/* UCRT per-process standard streams */
-FILE *__acrt_iob_func(unsigned idx);
-#define stdin (__acrt_iob_func(0))
-#define stdout (__acrt_iob_func(1))
-#define stderr (__acrt_iob_func(2))
+/* the c99rt standard streams */
+FILE *__c99m_iob(int idx);
+#define stdin (__c99m_iob(0))
+#define stdout (__c99m_iob(1))
+#define stderr (__c99m_iob(2))
 
 #define EOF (-1)
 #define BUFSIZ 512
@@ -41,23 +42,8 @@ int vsprintf(char *buf, const char *fmt, va_list ap);
 int _vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int _snprintf(char *buf, size_t n, const char *fmt, ...);
 
-/* C99 snprintf/vsnprintf: not exported by msvcrt/ucrtbase by name (the UCRT
- * inlines them), so build them here on ucrtbase's exported worker. Option 2 =
- * standard C99 snprintf behavior (NUL-terminate, return needed length). */
-long long __stdio_common_vsprintf(unsigned long long options, char *buf,
-                                  size_t n, const char *fmt, void *locale,
-                                  va_list ap);
-static int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
-  return (int)__stdio_common_vsprintf(2ULL, buf, n, fmt, (void *)0, ap);
-}
-static int snprintf(char *buf, size_t n, const char *fmt, ...) {
-  va_list ap;
-  int r;
-  va_start(ap, fmt);
-  r = (int)__stdio_common_vsprintf(2ULL, buf, n, fmt, (void *)0, ap);
-  va_end(ap);
-  return r;
-}
+int snprintf(char *buf, size_t n, const char *fmt, ...);
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int scanf(const char *fmt, ...);
 int sscanf(const char *s, const char *fmt, ...);
 int fscanf(FILE *f, const char *fmt, ...);

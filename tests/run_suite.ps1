@@ -108,6 +108,8 @@ Need (Run-Case "gaps/storage_stack" @("tests\storage_stack.c") 0 $null)
 Need (Run-Case "gaps/global_agg_init" @("tests\global_agg_init.c") 7 $null)
 Need (Run-Case "gaps/global_array_init" @("tests\global_array_init.c") 6 $null)
 Need (Run-Case "gaps/addr_taken_global_init" @("tests\addr_taken_global_init.c") 0 $null)
+Need (Run-Case "runtime/selfcontained_O0" @("-O0", "tests\runtime_selfcontained.c") 0 $null)
+Need (Run-Case "runtime/selfcontained_O1" @("-O1", "tests\runtime_selfcontained.c") 0 $null)
 
 # ---- diagnostics quality ----
 

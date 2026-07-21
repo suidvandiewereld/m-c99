@@ -7,15 +7,17 @@ module Main (main) where
 import Control.Monad (forM, unless, when)
 import qualified Data.ByteString.Char8 as BS
 import Data.List (isPrefixOf)
-import System.Environment (getArgs, lookupEnv)
+import System.Directory (doesFileExist)
+import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
+import System.FilePath (takeDirectory, (</>))
 import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
 
 import C99.Common
 import C99.CType (TypeContext, newTypeContext)
 import C99.Diag
 import C99.Explain (explain, explainIndex)
-import C99.Ast (Program)
+import C99.Ast (Program, TopDecl (..), FuncDef (..))
 import C99.Lexer (tokenize)
 import C99.Lower (lowerProgram)
 import C99.Parser (parseProgram)
@@ -41,6 +43,9 @@ data Options = Options
   , optMaxErrors :: !Int
   , optJson :: !Bool
   , optExplain :: Maybe String
+  , -- | Skip linking the self-contained runtime (mixed links that bring
+    -- their own libc).
+    optNoRt :: !Bool
   }
 
 defaults :: Options
@@ -60,6 +65,7 @@ defaults =
     , optMaxErrors = 100
     , optJson = False
     , optExplain = Nothing
+    , optNoRt = False
     }
 
 usage :: IO ()
@@ -78,6 +84,7 @@ usage = do
     , "  -S            emit object (same as -c; no asm text yet)"
     , "  --emit-ir     finish after lowering (smoke test; no output file)"
     , "  --static-prefix=<p>  prefix for file-scope static mangling"
+    , "  --no-rt       do not link the self-contained runtime (c99rt)"
     , "  -h, --help    this help"
     , ""
     , "Diagnostics:"
@@ -138,6 +145,7 @@ parseArgs (a : rest) o = case a of
     | a `elem` ["-O", "-O1", "-O2", "-O3"] -> parseArgs rest o {optOptLevel = 1}
     | "-I" `isPrefixOf` a, length a > 2 ->
         parseArgs rest o {optIncludes = drop 2 a : optIncludes o}
+    | a == "--no-rt" -> parseArgs rest o {optNoRt = True}
     | "--static-prefix=" `isPrefixOf` a ->
         parseArgs rest o {optStaticPrefix = drop 16 a}
     | "--explain=" `isPrefixOf` a -> parseArgs rest o {optExplain = Just (drop 10 a)}
@@ -161,6 +169,35 @@ parseArgs (a : rest) o = case a of
 
 fatal :: String -> IO a
 fatal msg = hPutStrLn stderr ("c99mtlc: " ++ msg) >> exitFailure
+
+-- | The c99rt sources, in link order.
+rtSources :: [FilePath]
+rtSources =
+  [ "rt_alloc.c"
+  , "rt_string.c"
+  , "rt_ctype.c"
+  , "rt_start.c"
+  , "rt_stdlib.c"
+  , "rt_stdio.c"
+  , "rt_format.c"
+  , "rt_scan.c"
+  , "rt_math.c"
+  , "rt_os.c"
+  ]
+
+-- | rt/ from the working directory first (running inside the repo), then
+-- next to the compiler binary, then one level up from it (bin/c99mtlc.exe
+-- with rt/ at the repo root).
+findRtDir :: IO (Maybe FilePath)
+findRtDir = do
+  exe <- getExecutablePath
+  let exeDir = takeDirectory exe
+      candidates = ["rt", exeDir </> "rt", takeDirectory exeDir </> "rt"]
+      probe [] = pure Nothing
+      probe (d : ds) = do
+        ok <- doesFileExist (d </> "rt_alloc.c")
+        if ok then pure (Just d) else probe ds
+  probe candidates
 
 lookupGroup :: String -> Maybe WarnGroup
 lookupGroup n = lookup n [(warnGroupName g, g) | g <- allWarnGroups]
@@ -303,9 +340,39 @@ compile sink opts ppopt = do
           then fatal "failed to parse the __int128 runtime"
           else pure (merged ++ mangleStatics "stU" 0 rprog, tc')
 
+  -- Every executable carries c99rt, the compiler's own C runtime, so the
+  -- only DLL a finished program imports is kernel32. Object-only builds
+  -- skip it: their final link brings a runtime of its own. A name the
+  -- program defines itself wins over the runtime's definition, which is
+  -- what weak linkage would do in a conventional toolchain.
+  (mergedRt, tcRt) <-
+    if optObjOnly opts || optNoRt opts
+      then pure (merged', tc2)
+      else do
+        rtdir <- findRtDir
+        case rtdir of
+          Nothing ->
+            fatal
+              "cannot find the c99rt runtime (rt/ next to the compiler); \
+              \use --no-rt to link against another runtime"
+          Just dir -> do
+            let userDefined = [fdName fd | TDFunc fd <- merged']
+            (rtProg, tcR, _, rtBad) <-
+              foldMTU
+                ( \i tc path -> do
+                    (prog, tc', saw, bad) <- parseTU sink ppopt tc path
+                    pure (mangleStatics "stC" i prog, tc', saw, bad)
+                )
+                tc2
+                (zip [0 ..] (map (dir </>) rtSources))
+            when rtBad $ fatal "the c99rt runtime failed to parse"
+            let keep (TDFunc fd) = fdName fd `notElem` userDefined
+                keep _ = True
+            pure (merged' ++ filter keep rtProg, tcR)
+
   -- Check what parsed even when some of it did not. A syntax error and a type
   -- error in the same build should come out of the same run.
-  let sr = semaCheck tc2 merged'
+  let sr = semaCheck tcRt mergedRt
   sinkReport sink (semaAfterParseErrors parseFailed (srMsgs sr))
   -- Ask the sink, not the message list: -Werror turns a warning into an error
   -- during reporting, which the pass that produced it cannot know.

@@ -78,10 +78,9 @@ float fminf(float x, float y);
 float fmaxf(float x, float y);
 float modff(float x, float *ip);
 
-/* not exported by msvcrt/ucrtbase on x64 (compiler intrinsics there) */
-static float fabsf(float x) { return (float)fabs((double)x); }
-static float ldexpf(float x, int e) { return (float)ldexp((double)x, e); }
-static float frexpf(float x, int *e) { return (float)frexp((double)x, e); }
+float fabsf(float x);
+float ldexpf(float x, int e);
+float frexpf(float x, int *e);
 
 int _isnan(double x);
 int _finite(double x);

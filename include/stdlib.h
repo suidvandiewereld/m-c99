@@ -66,22 +66,7 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
 
 char *_fullpath(char *buf, const char *path, size_t n);
 
-/* The UCRT's pgmptr is only populated by a full CRT startup, which the
- * libmtlc-synthesized entry point does not run — calling the real
- * _get_pgmptr aborts via the invalid-parameter handler. Resolve the
- * executable path from the OS instead. */
-unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int n);
-static int _get_pgmptr(char **value) {
-  static char __c99m_pgm_buf[260];
-  static int __c99m_pgm_got = 0;
-  if (!__c99m_pgm_got) {
-    if (GetModuleFileNameA((void *)0, __c99m_pgm_buf, 260u) == 0u)
-      return 22; /* EINVAL */
-    __c99m_pgm_got = 1;
-  }
-  *value = __c99m_pgm_buf;
-  return 0;
-}
+int _get_pgmptr(char **value);
 #define realpath(path, buf) _fullpath((buf), (path), 260)
 
 int mblen(const char *s, size_t n);
