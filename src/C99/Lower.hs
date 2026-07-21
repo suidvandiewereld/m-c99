@@ -1521,7 +1521,9 @@ genDirectCall e sym args = do
             memZero buf (max 1 sz)
             pure (Just buf)
           else pure Nothing
-      fixedArgs <- mapM genExpr (take nfixed args)
+      fixedArgs <- forM (zip fixed args) $ \(pt, a) -> do
+        v <- genExpr a
+        castTo v (exprTy a) pt
       buf <- stackBytes (max 1 extra * 8) Nothing
       forM_ (zip [0 ..] (drop nfixed args)) $ \(i, a) -> do
         v <- genExpr a
@@ -1547,7 +1549,14 @@ genDirectCall e sym args = do
       sz <- sizeOf retT
       buf <- stackBytes (max 1 sz) Nothing
       memZero buf (max 1 sz)
-      argv <- mapM genExpr args
+      let fixed = case symType sym of
+            TFunc _ ps _ _ -> ps
+            _ -> []
+      argv <- forM (zip [0 ..] args) $ \(i, a) -> do
+        v <- genExpr a
+        if i < length fixed
+          then castTo v (exprTy a) (fixed !! i)
+          else pure v
       p <- i8pL
       _ <- lift (call fn cname (buf : argv) p)
       pure buf
@@ -1555,10 +1564,11 @@ genDirectCall e sym args = do
     plainCall fn cname fixed = do
       argv <- forM (zip [0 ..] args) $ \(i, a) -> do
         v <- genExpr a
-        if symIsExtern sym && i < length fixed
-          then do
-            t <- mtlcOf (fixed !! i)
-            lift (cast fn v t)
+        -- every argument converts to its parameter type (C99 6.5.2.2p7),
+        -- extern or not: `f(1920)` into a double parameter must pass 1920.0,
+        -- not the integer's bit pattern
+        if i < length fixed
+          then castTo v (exprTy a) (fixed !! i)
           else pure v
       rt <- retTy (exprTy e)
       lift (call fn cname argv rt)
@@ -1834,7 +1844,14 @@ genVarDecl d = case dSym d of
                     fsym <- symOf fsid
                     if symKind fsym == SymFunc
                       then do
-                        argv <- mapM genExpr cargs
+                        let fixed = case symType fsym of
+                              TFunc _ ps _ _ -> ps
+                              _ -> []
+                        argv <- forM (zip [0 ..] cargs) $ \(i, a) -> do
+                          v <- genExpr a
+                          if i < length fixed
+                            then castTo v (exprTy a) (fixed !! i)
+                            else pure v
                         p8 <- i8pL
                         _ <- lift (call fn (symLinkName fsym) (loc : argv) p8)
                         pure ()
