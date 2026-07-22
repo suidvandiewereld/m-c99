@@ -22,7 +22,7 @@ import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 
 import C99.Ast
 import C99.Common
@@ -509,7 +509,7 @@ checkExpr e = case exNode e of
   EString s ->
     -- char[N], not char*: sizeof("ab") is 3. Use sites that want a pointer
     -- get one from the usual decay.
-    pure (setTy (TArray TChar (length s + 1) False) e)
+    pure (setTy (TArray TChar (length s + 1) AFixed) e)
   EIdent name _ -> checkIdent e name
   EBinary op l r -> checkBinary e op l r
   EUnary op x -> checkUnary e op x
@@ -522,11 +522,22 @@ checkExpr e = case exNode e of
   ESizeofExpr x -> do
     -- sizeof does not decay its operand
     x' <- checkExpr x
-    n <- sizeOfType (typeOf x')
-    pure (litULL (exLoc e) (fromIntegral n))
-  ESizeofType ty -> do
-    n <- sizeOfType ty
-    pure (litULL (exLoc e) (fromIntegral n))
+    -- A variably modified operand has no size until its bounds have been
+    -- read, so the node survives to lowering instead of folding here.
+    if typeIsVM (typeOf x')
+      then pure (setTy TULLong e {exNode = ESizeofExpr x'})
+      else do
+        n <- sizeOfType (typeOf x')
+        pure (litULL (exLoc e) (fromIntegral n))
+  ESizeofType ty
+    -- A type name carries no declaration, so nothing evaluates its bounds and
+    -- lowering has nothing to scale by. Say so rather than answer wrongly.
+    | typeIsVM ty -> do
+        errAt (exLoc e) "sizeof a variably modified type name is not supported"
+        pure (litULL (exLoc e) 0)
+    | otherwise -> do
+        n <- sizeOfType ty
+        pure (litULL (exLoc e) (fromIntegral n))
   ECond c l r -> do
     c' <- checkExpr c
     l' <- decayed <$> checkExpr l
@@ -864,6 +875,8 @@ checkCast :: Expr -> Type -> Expr -> Sema Expr
 checkCast e ty x0 = do
   x <- decayed <$> checkExpr x0
   tc <- tcGet
+  when (typeIsVM ty) $
+    errAt (exLoc e) "cast to a variably modified type is not supported"
   let it = typeOf x
       loc = exLoc e
   case () of
@@ -1028,14 +1041,16 @@ checkDecl isGlobal d0 = case dStorage d0 of
     let d1 = inferArrayLen d0
     -- A VLA bound that folds to a constant (common when it is sizeof
     -- arithmetic the parser could not fold) demotes to a fixed array.
-    (d2, vla') <- case dVlaSize d1 of
-      Nothing -> pure (d1, Nothing)
-      Just sz -> do
-        sz' <- checkExpr sz
-        case (dType d1, foldConst sz') of
-          (TArray b _ True, Just n) | n > 0 ->
-            pure (d1 {dType = TArray b (fromIntegral n) False}, Nothing)
-          _ -> pure (d1, Just sz')
+    (d2, vla') <- do
+      bs <- mapM (\(i, sz) -> (,) i <$> checkExpr sz) (dVlaBounds d1)
+      let fixed =
+            [ (i, fromIntegral n)
+            | (i, sz') <- bs
+            , Just n <- [foldConst sz']
+            , n > 0
+            ]
+          keep = [b | b@(i, _) <- bs, isNothing (lookup i fixed)]
+      pure (d1 {dType = demoteVla fixed (dType d1)}, keep)
     existing <- if isGlobal then pure (dSym d2) else pure Nothing
     sid <- case existing of
       Just sid -> do
@@ -1062,7 +1077,15 @@ checkDecl isGlobal d0 = case dStorage d0 of
         when (isGlobal || isStatic) (addGlobal sid)
         pure sid
     ini <- mapM checkInit (dInit d2)
-    pure d2 {dSym = Just sid, dInit = ini, dVlaSize = vla'}
+    pure d2 {dSym = Just sid, dInit = ini, dVlaBounds = vla'}
+
+-- | Replace each VLA bound that turned out to be constant with a fixed one.
+demoteVla :: [(Int, Int)] -> Type -> Type
+demoteVla m t = case t of
+  TArray b _ (AVla i) | Just c <- lookup i m -> TArray (demoteVla m b) c AFixed
+  TArray b n k -> TArray (demoteVla m b) n k
+  TPtr b -> TPtr (demoteVla m b)
+  _ -> t
 
 -- ---- program ----
 
@@ -1155,11 +1178,16 @@ checkPass td = case td of
         else do
           sid <- insertSym SymVar (pName p) pt (fdLoc fd) False
           pure p {pType = pt, pSym = Just sid}
+    -- A parameter's array bounds name earlier parameters, so they can only be
+    -- checked once every parameter is in scope.
+    params' <- forM params $ \p -> do
+      bs <- mapM (\(i, x) -> (,) i <$> checkExpr x) (pVlaBounds p)
+      pure p {pVlaBounds = bs}
     body <- checkStmt (fdBody fd)
     warnMissingReturn fd body
     modify' (\s -> s {ssRetTy = Nothing})
     popScope
-    pure (TDFunc fd {fdParams = params, fdBody = body})
+    pure (TDFunc fd {fdParams = params', fdBody = body})
   TDDecl d
     | dStorage d /= ScTypedef
     , not (isFuncTy (dType d)) ->

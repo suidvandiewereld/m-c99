@@ -13,6 +13,7 @@
 module C99.CType
   ( -- * Types
     Type (..)
+  , ArrKind (..)
   , TagId
   , Member (..)
   , TagInfo (..)
@@ -37,6 +38,7 @@ module C99.CType
   , typeIsScalar
   , typeIsPointerLike
   , typeIsAggregate
+  , typeIsVM
     -- * Relations
   , typeEqual
   , typeCompatible
@@ -51,6 +53,19 @@ module C99.CType
 
 import Data.Bits ((.&.), complement)
 import qualified Data.Map.Strict as M
+
+-- | How an array bound was written.
+--
+-- @AVla@ carries the id of the expression that gives the bound. The expression
+-- itself cannot live here (it is typed, and types cannot refer to the AST), so
+-- the declaration that introduced the array carries it and lowering evaluates
+-- it once into a hidden local keyed by this id.
+data ArrKind
+  = AFixed
+  | AVla !Int
+  | -- | @[*]@ in a prototype: variably modified, bound unspecified.
+    AStar
+  deriving (Eq, Show)
 
 -- | A struct, union, or enum tag. Identity, not structure: two TStructs are
 -- the same type exactly when their TagIds match, which is what C's nominal
@@ -75,10 +90,10 @@ data Type
   | TDouble
   | TLDouble -- lowered as double
   | TPtr Type
-  | -- | Element type, length (0 = incomplete/unsized), and whether the bound
-    -- was a VLA expression. A VLA with a constant bound is demoted to a fixed
-    -- array by sema; anything else is diagnosed.
-    TArray Type !Int !Bool
+  | -- | Element type, length (0 = incomplete/unsized), and how the bound was
+    -- written. A VLA with a constant bound is demoted to a fixed array by
+    -- sema; the rest keep the id of their run-time bound.
+    TArray Type !Int !ArrKind
   | TFunc
       { funcRet :: Type
       , funcParams :: [Type]
@@ -376,6 +391,16 @@ typeIsAggregate t = case t of
   TComplex _ -> True
   _ -> False
 
+-- | Is this type variably modified: does any array bound in it depend on a
+-- run-time value? Such a type has no compile-time size, so every place that
+-- scales by it has to compute the size instead of reading it off the type.
+typeIsVM :: Type -> Bool
+typeIsVM t = case t of
+  TArray e _ AFixed -> typeIsVM e
+  TArray {} -> True
+  TPtr e -> typeIsVM e
+  _ -> False
+
 -- ---- relations ----
 
 typeEqual :: Type -> Type -> Bool
@@ -503,7 +528,8 @@ typeToString tc t = case t of
   TDouble -> "double"
   TLDouble -> "long double"
   TPtr b -> typeToString tc b ++ "*"
-  TArray b n _ -> typeToString tc b ++ "[" ++ show n ++ "]"
+  TArray b n k ->
+    typeToString tc b ++ "[" ++ (if k == AFixed then show n else "") ++ "]"
   TFunc {funcRet = r} -> "fn returning " ++ typeToString tc r
   TStruct tid ->
     let info = tagInfo tc tid

@@ -45,7 +45,8 @@ mangleStatics prefix tu prog
       TDFunc fd ->
         -- Function parameters shadow for the body.
         let rm = foldr (M.delete . pName) renames (fdParams fd)
-            fd' = fd {fdBody = stmt rm (fdBody fd)}
+            prm p = p {pVlaBounds = map (fmap (expr rm)) (pVlaBounds p)}
+            fd' = fd {fdBody = stmt rm (fdBody fd), fdParams = map prm (fdParams fd)}
          in TDFunc fd' {fdName = rename (fdName fd')}
       TDDecl d ->
         let d' = d {dInit = fmap (initz renames) (dInit d)}
@@ -98,7 +99,7 @@ localDecl :: Renames -> Decl -> Decl
 localDecl rm d =
   d
     { dInit = fmap (initz rm) (dInit d)
-    , dVlaSize = fmap (expr rm) (dVlaSize d)
+    , dVlaBounds = map (fmap (expr rm)) (dVlaBounds d)
     }
 
 initz :: Renames -> Init -> Init

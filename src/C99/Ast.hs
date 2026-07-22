@@ -221,8 +221,10 @@ data Decl = Decl
   , dInit :: Maybe Init
   , -- | GCC asm label: @int f() __asm__("real_name")@ overrides the link name.
     dAsmLabel :: Maybe String
-  , -- | The bound expression of a VLA, when it did not fold to a constant.
-    dVlaSize :: Maybe Expr
+  , -- | Every array bound in this declarator that did not fold to a constant,
+    -- outermost first, keyed by the id the type carries. Lowering evaluates
+    -- each once when the declaration is reached.
+    dVlaBounds :: [(Int, Expr)]
   , dSym :: Maybe SymId
   }
   deriving (Eq, Show)
@@ -230,6 +232,9 @@ data Decl = Decl
 data Param = Param
   { pName :: String
   , pType :: Type
+  , -- | As 'dVlaBounds'. A parameter's bounds name earlier parameters, so
+    -- lowering evaluates them on entry, in order.
+    pVlaBounds :: [(Int, Expr)]
   , pSym :: Maybe SymId
   }
   deriving (Eq, Show)

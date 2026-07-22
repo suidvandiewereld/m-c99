@@ -17,7 +17,7 @@ import Control.Monad (unless, when)
 import Control.Monad.State.Strict
 import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.Map.Strict as M
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe)
 
 import C99.Ast
 import C99.CType
@@ -39,10 +39,14 @@ data PState = PState
     psTagScopes :: [M.Map (TagKind, String) TagId]
   , psMsgs :: [Message] -- reversed
   , psSawInt128 :: !Bool
-  , -- | Whether the declarator being parsed wants the bound of a VLA reported,
-    -- and the first such bound if one has been seen.
-    psVlaOn :: !Bool
-  , psVlaSize :: Maybe Expr
+  , -- | Every array bound in the declarator being parsed that did not fold to
+    -- a constant, paired with the id its type carries. Lowering evaluates each
+    -- one once and keys the run-time size off that id, so a bound has to reach
+    -- the declaration that owns it.
+    psVlaBounds :: [(Int, Expr)]
+  , -- | Source of those ids. Never restored: an id must be unique across the
+    -- whole translation unit.
+    psVlaNext :: !Int
   , -- | Enumerators declared inside a function body. They are hoisted to the
     -- top level, which is the only place the AST can hold them.
     psPending :: [TopDecl]
@@ -66,8 +70,8 @@ parseProgram tc toks =
           , psTagScopes = [M.empty]
           , psMsgs = []
           , psSawInt128 = False
-          , psVlaOn = False
-          , psVlaSize = Nothing
+          , psVlaBounds = []
+          , psVlaNext = 1
           , psPending = []
           }
       (prog, st) = runState program st0
@@ -928,24 +932,19 @@ type DeclResult = (Type, Maybe String, Maybe [Param])
 
 parseDeclarator :: Type -> P DeclResult
 parseDeclarator base = do
-  savedOn <- gets psVlaOn
-  savedSz <- gets psVlaSize
-  modify' $ \s -> s {psVlaOn = False}
-  r <- parsePointers base >>= parseDirectDeclarator
-  modify' $ \s -> s {psVlaOn = savedOn, psVlaSize = savedSz}
-  pure r
+  (ty, nm, ps, _) <- parseDeclaratorVla base
+  pure (ty, nm, ps)
 
--- | As 'parseDeclarator', but also reports the bound of a VLA that did not fold
--- to a constant.
-parseDeclaratorVla :: Type -> P (Type, Maybe String, Maybe [Param], Maybe Expr)
+-- | As 'parseDeclarator', but also reports the bounds of any array in the
+-- declarator that did not fold to a constant, outermost first.
+parseDeclaratorVla :: Type -> P (Type, Maybe String, Maybe [Param], [(Int, Expr)])
 parseDeclaratorVla base = do
-  savedOn <- gets psVlaOn
-  savedSz <- gets psVlaSize
-  modify' $ \s -> s {psVlaOn = True, psVlaSize = Nothing}
+  saved <- gets psVlaBounds
+  modify' $ \s -> s {psVlaBounds = []}
   (ty, nm, ps) <- parsePointers base >>= parseDirectDeclarator
-  sz <- gets psVlaSize
-  modify' $ \s -> s {psVlaOn = savedOn, psVlaSize = savedSz}
-  pure (ty, nm, ps, sz)
+  got <- gets psVlaBounds
+  modify' $ \s -> s {psVlaBounds = saved}
+  pure (ty, nm, ps, reverse got)
 
 parseDirectDeclarator :: Type -> P DeclResult
 parseDirectDeclarator base = do
@@ -987,12 +986,12 @@ parsePostfixDeclarator base = do
     TkLBracket -> do
       advance
       skipArrayQuals
-      (len, isVla) <- parseArrayBound
+      (len, kind) <- parseArrayBound
       expect TkRBracket
       -- `int a[3][4]` is array[3] of array[4] of int: the leftmost bracket is
       -- the outermost array, so the suffixes to the right are applied first.
       (elemTy, ps) <- parsePostfixDeclarator base
-      pure (TArray elemTy len isVla, ps)
+      pure (TArray elemTy len kind, ps)
     _ -> pure (base, Nothing)
   where
     skipArrayQuals = do
@@ -1000,25 +999,25 @@ parsePostfixDeclarator base = do
       when (k == TkStatic || k == TkConst || k == TkVolatile || k == TkRestrict) $
         advance >> skipArrayQuals
 
-parseArrayBound :: P (Int, Bool)
+parseArrayBound :: P (Int, ArrKind)
 parseArrayBound = do
   k <- curKind
   n <- peekKind
   if k == TkStar && n == TkRBracket
-    then advance >> pure (0, True) -- [*]: unspecified VLA bound
+    then advance >> pure (0, AStar)
     else
       if k == TkRBracket
-        then pure (0, False)
+        then pure (0, AFixed)
         else do
           bound <- parseAssign
           v <- foldConst bound
           case v of
-            Just c | c >= 0 -> pure (fromInteger c, False)
+            Just c | c >= 0 -> pure (fromInteger c, AFixed)
             _ -> do
-              on <- gets psVlaOn
-              sz <- gets psVlaSize
-              when (on && isNothing sz) $ modify' $ \s -> s {psVlaSize = Just bound}
-              pure (0, True)
+              i <- gets psVlaNext
+              modify' $ \s ->
+                s {psVlaNext = i + 1, psVlaBounds = (i, bound) : psVlaBounds s}
+              pure (0, AVla i)
 
 parseParamList :: Type -> P (Type, Maybe [Param])
 parseParamList ret = do
@@ -1041,8 +1040,8 @@ parseParamList ret = do
         then finish acc True
         else do
           (bs, _, saw, _) <- parseDeclSpecs
-          (pt0, pname, _) <- parseDeclarator (if saw then bs else TInt)
-          let p = Param (fromMaybe "" pname) (typeDecay pt0) Nothing
+          (pt0, pname, _, vb) <- parseDeclaratorVla (if saw then bs else TInt)
+          let p = Param (fromMaybe "" pname) (typeDecay pt0) vb Nothing
           more <- match TkComma
           if more then loop (p : acc) else finish (p : acc) False
 
@@ -1274,7 +1273,7 @@ parseAsmLabel = do
 
 -- | The declarator list of one declaration: everything after the specifiers, up
 -- to but not including the ';'.
-declSeq :: Bool -> SrcLoc -> Type -> StorageClass -> (Type, Maybe String, Maybe Expr) -> P [Decl]
+declSeq :: Bool -> SrcLoc -> Type -> StorageClass -> (Type, Maybe String, [(Int, Expr)]) -> P [Decl]
 declSeq wantVla loc base sc first = go first []
   where
     go (ty, mname, vla) acc = do
@@ -1291,7 +1290,7 @@ declSeq wantVla loc base sc first = go first []
               , dStorage = sc
               , dInit = ini
               , dAsmLabel = lbl
-              , dVlaSize = vla
+              , dVlaBounds = vla
               , dSym = Nothing
               }
       more <- match TkComma
@@ -1307,7 +1306,7 @@ declSeq wantVla loc base sc first = go first []
           pure (ty, nm, vla)
       | otherwise = do
           (ty, nm, _) <- parseDeclarator base
-          pure (ty, nm, Nothing)
+          pure (ty, nm, [])
 
 isFuncType :: Type -> Bool
 isFuncType TFunc {} = True
@@ -1413,7 +1412,7 @@ topDecl = do
                       }
               pure (enumConsts base es ++ [TDFunc fd])
             else do
-              ds <- declSeq False loc base sc (ty, mname, Nothing)
+              ds <- declSeq False loc base sc (ty, mname, [])
               expect TkSemi
               pure (enumConsts base es ++ map TDDecl ds)
   where

@@ -46,6 +46,10 @@ data LowerState = LowerState
   , -- | Aggregate locals: the handle holds the object's base address. Reading
     -- one yields the address, never a load through it.
     lsPtrs :: M.Map SymId Value
+  , -- | Run-time array bounds, keyed by the id the type carries. Filled in on
+    -- entry to a function for its parameters, and where a declaration is
+    -- reached for its locals. A u64 value each.
+    lsVla :: M.Map Int Value
   , -- | Interned string literals: content -> name of its pointer global.
     lsStrings :: M.Map String String
   , -- | Pointer globals already lazily-initialized in the current function.
@@ -99,6 +103,7 @@ lowerProgram sr = do
           , lsGlobalInits = []
           , lsAggGlobals = []
           , lsNeedGlobalInit = False
+          , lsVla = M.empty
           , lsMsgs = []
           }
   (mmod, st) <- runStateT (run (srProgram sr)) st0
@@ -195,6 +200,62 @@ sizeOf t = do
   tc <- gets lsTc
   pure (typeSize tc t)
 
+-- | The size of a type as a run-time u64 value.
+--
+-- Every stride goes through here rather than through 'sizeOf', because a
+-- variably modified type has no size until its bounds have been evaluated:
+-- @int a[n][m]@ steps by @m * 4@ bytes per row, a number the type can only
+-- point at. For everything else this is just a constant, so the IR is the
+-- same as before.
+sizeOfV :: Type -> Lower Value
+sizeOfV t
+  | not (typeIsVM t) = do
+      n <- max 1 <$> sizeOf t
+      constU64 (fromIntegral n)
+sizeOfV (TArray el n k) = do
+  fn <- gets lsFn
+  u64 <- u64L
+  esz <- sizeOfV el
+  cnt <- case k of
+    AVla i -> vlaBound i
+    AStar -> constU64 1
+    AFixed -> constU64 (fromIntegral (max 1 n))
+  lift (binary fn "*" cnt esz u64)
+sizeOfV t = do
+  n <- max 1 <$> sizeOf t
+  constU64 (fromIntegral n)
+
+constU64 :: Integer -> Lower Value
+constU64 n = do
+  fn <- gets lsFn
+  u64 <- u64L
+  lift (constInt fn u64 (fromIntegral n))
+
+-- | The evaluated bound behind a VLA id. A miss means nothing evaluated the
+-- bound, which sema is supposed to have rejected; say so rather than scale by
+-- a number that happens to keep the IR well-formed.
+vlaBound :: Int -> Lower Value
+vlaBound i = do
+  m <- gets lsVla
+  case M.lookup i m of
+    Just v -> pure v
+    Nothing -> do
+      err noLoc "internal: array bound used before it was evaluated"
+      constU64 1
+
+-- | Evaluate a declaration's run-time bounds and remember them. A bound is
+-- read once, where the declaration is: C says the type is fixed from then on,
+-- even if the variables it named change afterwards.
+bindVlaBounds :: [(Int, Expr)] -> Lower ()
+bindVlaBounds bs = forM_ bs $ \(i, e) -> do
+  fn <- gets lsFn
+  u64 <- u64L
+  v <- genExpr e
+  v' <- lift (cast fn v u64)
+  home <- lift (local fn ("__vlab" ++ show i) u64)
+  lift (assign fn home v')
+  modify' $ \s -> s {lsVla = M.insert i home (lsVla s)}
+
 symOf :: SymId -> Lower Symbol
 symOf sid = gets ((M.! sid) . lsSyms)
 
@@ -221,8 +282,7 @@ ptrStep :: Value -> Value -> Type -> String -> Type -> Lower Value
 ptrStep pv iv el o resTy = do
   fn <- gets lsFn
   u64 <- u64L
-  esz <- max 1 <$> sizeOf el
-  scale <- lift (constInt fn u64 (fromIntegral esz))
+  scale <- sizeOfV el
   i <- lift (cast fn iv u64)
   off <- lift (binary fn "*" i scale u64)
   p <- lift (cast fn pv u64)
@@ -615,10 +675,9 @@ genLvalueAddr e = case exNode e of
     b <- genExpr base
     i <- genExpr idx
     u64 <- u64L
-    esz <- case typeDecay (exprTy base) of
-      TPtr el -> max 1 <$> sizeOf el
-      _ -> max 1 <$> sizeOf (exprTy e)
-    scale <- lift (constInt fn u64 (fromIntegral esz))
+    scale <- case typeDecay (exprTy base) of
+      TPtr el -> sizeOfV el
+      _ -> sizeOfV (exprTy e)
     i' <- lift (cast fn i u64)
     off <- lift (binary fn "*" i' scale u64)
     b' <- lift (cast fn b u64)
@@ -949,8 +1008,9 @@ genExpr e = case exNode e of
         fn <- gets lsFn
         t <- mtlcOf ty
         lift (cast fn v t)
-  ESizeofExpr _ -> zeroI32 -- sema replaced these with literals
-  ESizeofType _ -> zeroI32
+  -- Sema folded every size it could; what is left is variably modified.
+  ESizeofExpr x -> sizeOfV (exprTy x)
+  ESizeofType ty -> sizeOfV ty
   ECond c l r -> do
     fn <- gets lsFn
     nm <- freshTmp "cond"
@@ -1238,11 +1298,17 @@ genBinary e op l r
       d <- lift (binary fn "-" a b i64)
       esz <- max 1 <$> sizeOf el
       d' <-
-        if esz > 1
+        if typeIsVM el
           then do
-            scale <- lift (constInt fn i64 (fromIntegral esz))
+            szv <- sizeOfV el
+            scale <- lift (cast fn szv i64)
             lift (binary fn "/" d scale i64)
-          else pure d
+          else
+            if esz > 1
+              then do
+                scale <- lift (constInt fn i64 (fromIntegral esz))
+                lift (binary fn "/" d scale i64)
+              else pure d
       castTo d' TLLong (exprTy e)
 
 genComplexBinary :: Expr -> BinOp -> Expr -> Expr -> Lower Value
@@ -1798,6 +1864,9 @@ genVarDecl d = case dSym d of
     if symIsGlobal sym
       then pure ()
       else do
+        -- The bounds go first: the storage below is sized from them, and so is
+        -- every later step through this object.
+        bindVlaBounds (dVlaBounds d)
         fn <- gets lsFn
         let ty = dType d
             -- IR locals are name-scoped per function, and C block scoping
@@ -1810,15 +1879,9 @@ genVarDecl d = case dSym d of
           then do
             bytes <- sizeOf ty
             mem <- case ty of
-              TArray el _ True -> do
+              _ | typeIsVM ty -> do
                 -- a VLA: size known only at run time, so it goes on the heap
-                u64 <- u64L
-                esz <- max 1 <$> sizeOf el
-                cnt <- case dVlaSize d of
-                  Just sz -> genExpr sz >>= \v -> lift (cast fn v u64)
-                  Nothing -> lift (constInt fn u64 1)
-                es <- lift (constInt fn u64 (fromIntegral esz))
-                nb <- lift (binary fn "*" cnt es u64)
+                nb <- sizeOfV ty
                 heapBytes (Right nb)
               _ -> do
                 mem <- stackBytes (max 1 bytes) (Just irName)
@@ -1904,6 +1967,7 @@ genFunction fd = do
           , lsEmittedReturn = False
           , lsVaParam = Nothing
           , lsSretParam = Nothing
+          , lsVla = M.empty
           }
       let arg0 = if isSret then 1 else 0
       when isSret $ do
@@ -1931,6 +1995,12 @@ genFunction fd = do
                     , lsPtrs = M.insert sid loc (lsPtrs s)
                     }
               else modify' (\s -> s {lsLocals = M.insert sid v (lsLocals s)})
+      -- A parameter's array bounds name earlier parameters, so they can only
+      -- be read once every parameter is bound. `int a[n][m]` steps by `m * 4`
+      -- bytes per row, and that has to come from the caller's m, not from the
+      -- type, which no longer knows.
+      mapM_ (bindVlaBounds . pVlaBounds) params
+
       when isVar $ do
         v <- lift (fnParam fn (arg0 + length params))
         modify' (\s -> s {lsVaParam = Just v})
