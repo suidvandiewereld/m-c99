@@ -55,7 +55,7 @@ data LowerState = LowerState
     -- reached for its locals. A u64 value each.
     lsVla :: M.Map Int Value
   , -- | Interned string literals: content -> name of its pointer global.
-    lsStrings :: M.Map String String
+    lsStrings :: M.Map (String, Bool) String
   , -- | Pointer globals already lazily-initialized in the current function.
     -- Functions run in arbitrary order, so this must be per-function: relying
     -- on the module-wide first use leaves the pointer null in earlier callers.
@@ -580,32 +580,39 @@ genInit1 (IList _) = do
 -- cannot hand out a @char*@ into .data — mtlc_address_of is only defined for
 -- locals and parameters — so this is the only way to get a stable pointer with
 -- static duration.
-genString :: String -> Lower Value
-genString s = do
-  ptrname <- prepareString s
+genString :: String -> Bool -> Lower Value
+genString s w = do
+  ptrname <- prepareString (s, w)
   fn <- gets lsFn
   lift (globalRef fn ptrname)
 
 -- | Intern a literal and make sure its pointer is filled in, without producing
 -- a value. This is what the entry-block pass wants: the check, and nothing to
 -- leave dangling in the IR.
-prepareString :: String -> Lower String
-prepareString s = do
+prepareString :: (String, Bool) -> Lower String
+prepareString key = do
   interned <- gets lsStrings
-  ptrname <- case M.lookup s interned of
+  ptrname <- case M.lookup key interned of
     Just p -> pure p
-    Nothing -> newString s
-  ensureString ptrname s
+    Nothing -> newString key
+  ensureString ptrname (litBytes key)
   pure ptrname
 
-newString :: String -> Lower String
-newString s = do
+-- | The bytes a literal occupies, terminator included. A wide one is UTF-16,
+-- so the source text is decoded from UTF-8 and re-encoded, and its terminator
+-- is two bytes rather than one.
+litBytes :: (String, Bool) -> [Int]
+litBytes (str, True) = utf16Bytes str
+litBytes (str, False) = map ord str ++ [0]
+
+newString :: (String, Bool) -> Lower String
+newString key = do
   b <- gets lsBuilder
   n <- gets lsStrId
   tag <- gets lsTag
   modify' $ \st -> st {lsStrId = n + 1}
   let base = ".str" ++ tag ++ "_" ++ show n
-      bytes = map (fromIntegral . ord) s ++ [0] :: [Word64]
+      bytes = map fromIntegral (litBytes key) :: [Word64]
       words' = chunk8 bytes
   u64 <- u64L
   forM_ (zip [0 :: Int ..] words') $ \(w, packed) ->
@@ -613,7 +620,7 @@ newString s = do
   p <- i8pL
   let ptrname = base ++ "_p"
   lift (builderGlobal b ptrname p 0 False)
-  modify' $ \st -> st {lsStrings = M.insert s ptrname (lsStrings st)}
+  modify' $ \st -> st {lsStrings = M.insert key ptrname (lsStrings st)}
   pure ptrname
   where
     chunk8 [] = []
@@ -625,7 +632,7 @@ newString s = do
 -- | Every string literal the body mentions, in order, without duplicates.
 --
 -- Lowering needs these before it emits the body: see 'ensureString'.
-stringsIn :: Stmt -> [String]
+stringsIn :: Stmt -> [(String, Bool)]
 stringsIn body = nub (stmt body)
   where
     stmt (Stmt _ n) = case n of
@@ -655,7 +662,7 @@ stringsIn body = nub (stmt body)
     desig _ = []
 
     expr (Expr _ _ n) = case n of
-      EString str -> [str]
+      EString str w -> [(str, w)]
       EBinary _ a b -> expr a ++ expr b
       EUnary _ a -> expr a
       EPostfix _ a -> expr a
@@ -678,8 +685,8 @@ stringsIn body = nub (stmt body)
 -- whatever branch that was, and a use in a sibling branch then reads a null
 -- pointer. That is what crashed 83 of Mettle's own tests, from a diagnostic
 -- renderer that spells the same format string in two arms of an @if@.
-ensureString :: String -> String -> Lower ()
-ensureString ptrname s = do
+ensureString :: String -> [Int] -> Lower ()
+ensureString ptrname bytes = do
   ensured <- gets lsFnStrEnsured
   unless (ptrname `elem` ensured) $ do
     modify' $ \st -> st {lsFnStrEnsured = ptrname : lsFnStrEnsured st}
@@ -693,7 +700,6 @@ ensureString ptrname s = do
     lift (branchIfZero fn g need)
     lift (jump fn done)
     lift (label fn need)
-    let bytes = map ord s ++ [0]
     mem <- heapBytes (Left (length bytes))
     forM_ (zip [0 :: Int ..] bytes) $ \(i, ch) -> do
       off <- lift (constInt fn u64 (fromIntegral i))
@@ -919,22 +925,27 @@ genInitInto ty baseAddr ini = case (ty, ini) of
   (TArray el _ _, IList items) -> do
     _ <- foldM (arrayItem el) 0 items
     pure ()
+  -- `char a[] = "text";` and `wchar_t w[] = L"text";` copy the literal into
+  -- the array rather than pointing at it. A wide one stores UTF-16 units, so
+  -- both the element width and the count come from the decoding.
   (TArray el _ _, IExpr s)
-    | EString str <- exNode s
-    , isCharLike el -> do
-        n <- arrayLimit ty (length str + 1)
+    | EString str isWide <- exNode s
+    , if isWide then isWideCharLike el else isCharLike el -> do
+        let units = if isWide then utf16Units str else map ord str
+            step = if isWide then 2 else 1
+        n <- arrayLimit ty (length units + 1)
         fn <- gets lsFn
-        i8 <- lift (tyScalar I8)
+        ity <- lift (tyScalar (if isWide then I16 else I8))
         u64 <- u64L
         forM_ [0 .. n - 1] $ \i -> do
-          let ch = if i < length str then ord (str !! i) else 0
-          off <- lift (constInt fn u64 (fromIntegral i))
+          let ch = if i < length units then units !! i else 0
+          off <- lift (constInt fn u64 (fromIntegral (i * step)))
           a <- lift (cast fn baseAddr u64)
           addr <- lift (binary fn "+" a off u64)
-          pi8 <- lift (tyPointer i8)
-          addr' <- lift (cast fn addr pi8)
-          c <- lift (constInt fn i8 (fromIntegral ch))
-          lift (store fn addr' c i8)
+          pity <- lift (tyPointer ity)
+          addr' <- lift (cast fn addr pity)
+          c <- lift (constInt fn ity (fromIntegral ch))
+          lift (store fn addr' c ity)
   (_, IExpr x)
     -- aggregate copy-initialization: `P y = x;` copies the object's bytes
     | isAgg ty
@@ -965,6 +976,8 @@ genInitInto ty baseAddr ini = case (ty, ini) of
     isComplex (TComplex _) = True
     isComplex _ = False
     isCharLike t = t `elem` [TChar, TSChar, TUChar]
+
+    isWideCharLike t = t == wcharType || t `elem` [TShort, TUShort]
 
     arrayLimit (TArray _ n _) want
       | n > 0 = pure (min want n)
@@ -1021,7 +1034,7 @@ genExpr e = case exNode e of
     fn <- gets lsFn
     t <- mtlcOf (exprTy e)
     lift (constInt fn t n)
-  EChar n -> do
+  EChar n _ -> do
     fn <- gets lsFn
     t <- mtlcOf (exprTy e)
     lift (constInt fn t n)
@@ -1029,7 +1042,7 @@ genExpr e = case exNode e of
     fn <- gets lsFn
     t <- mtlcOf (exprTy e)
     lift (constFloat fn t d)
-  EString s -> genString s
+  EString str w -> genString str w
   EIdent _ (Just sid) -> genIdent e sid
   EIdent name Nothing -> do
     err (exLoc e) ("unresolved identifier '" ++ name ++ "'")
@@ -1141,7 +1154,13 @@ genIdent e sid = do
         -- An aggregate local's handle holds the object's base address. After
         -- array-to-pointer decay exTy is a pointer, but the value is still that
         -- address: loading through it would be a dereference.
-        Just p -> pure p
+        Just p
+          | isAgg (symType sym) -> pure p
+          -- A scalar with storage instead of a handle is a volatile one, and
+          -- naming it is a read of that memory.
+          | otherwise -> do
+              t <- mtlcOf (exprTy e)
+              lift (load fn p t)
         Nothing
           | symIsGlobal sym ->
               if isAddrGlobal sym
@@ -2012,17 +2031,37 @@ genVarDecl d = case dSym d of
                         pure ()
                       else genInitInto ty loc ini
                 | otherwise -> genInitInto ty loc ini
-          else do
-            t <- mtlcOf ty
-            loc <- lift (local fn irName t)
-            modify' $ \s -> s {lsLocals = M.insert sid loc (lsLocals s)}
-            case dInit d of
-              Nothing -> pure ()
-              Just (IExpr x) -> do
-                v <- genExpr x
-                v' <- castTo v (exprTy x) ty
-                lift (assign fn loc v')
-              Just ini -> genInitInto ty loc ini
+          else if dVolatile d
+            then do
+              -- A volatile scalar is read from memory every time it is named
+              -- and written to memory every time it is assigned, so it gets
+              -- storage rather than a value handle no optimizer may keep in a
+              -- register. That memory is what carries it across a longjmp,
+              -- which restores every register but touches nothing on the
+              -- stack. The base goes in lsPtrs, which already means "the
+              -- storage is at this address"; genIdent loads through it because
+              -- the object is not an aggregate.
+              bytes <- sizeOf ty
+              mem <- stackBytes (max 1 bytes) (Just irName)
+              memZero mem (max 1 bytes)
+              p8 <- i8pL
+              base <- lift (local fn (irName ++ "_v") p8)
+              lift (assign fn base mem)
+              modify' $ \s -> s {lsPtrs = M.insert sid base (lsPtrs s)}
+              case dInit d of
+                Nothing -> pure ()
+                Just ini -> genInitInto ty base ini
+            else do
+              t <- mtlcOf ty
+              loc <- lift (local fn irName t)
+              modify' $ \s -> s {lsLocals = M.insert sid loc (lsLocals s)}
+              case dInit d of
+                Nothing -> pure ()
+                Just (IExpr x) -> do
+                  v <- genExpr x
+                  v' <- castTo v (exprTy x) ty
+                  lift (assign fn loc v')
+                Just ini -> genInitInto ty loc ini
 
 -- ---- functions ----
 

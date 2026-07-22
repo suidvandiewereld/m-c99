@@ -22,7 +22,7 @@ import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 
 import C99.Ast
 import C99.Common
@@ -384,14 +384,24 @@ modifySym sid f = modify' $ \s -> s {ssSyms = M.adjust f sid (ssSyms s)}
 -- prototype, an extern re-declaration, a repeated enum constant or typedef)
 -- returns the existing symbol instead of erroring.
 insertSym :: SymKind -> String -> Type -> SrcLoc -> Bool -> Sema SymId
-insertSym kind name ty loc declIsExtern = do
+insertSym kind name ty loc declIsExtern = insertSymInit kind name ty loc declIsExtern False
+
+-- | As 'insertSym', but says whether this declaration carries an initializer.
+-- At file scope a declaration without one is a tentative definition (C99
+-- 6.9.2): `int x;` may be written as often as you like, and only a second
+-- initializer makes it a redefinition.
+insertSymInit :: SymKind -> String -> Type -> SrcLoc -> Bool -> Bool -> Sema SymId
+insertSymInit kind name ty loc declIsExtern declHasInit = do
   existing <- lookupLocal name
   case existing of
     Just sid -> do
       old <- getSym sid
       let ok = case (kind, symKind old) of
             (SymFunc, SymFunc) -> True
-            (SymVar, SymVar) -> symIsExtern old || declIsExtern
+            (SymVar, SymVar) ->
+              symIsExtern old
+                || declIsExtern
+                || not (symHasInit old && declHasInit)
             (SymEnumConst, SymEnumConst) -> True
             (SymTypedef, SymTypedef) -> True
             _ -> False
@@ -424,6 +434,7 @@ insertSym kind name ty loc declIsExtern = do
               , symIsGlobal = False
               , symIsStatic = False
               , symIsDefined = False
+              , symHasInit = False
               , symAddrTaken = False
               }
       put
@@ -477,7 +488,7 @@ isLvalue e = case exNode e of
 foldConst :: Expr -> Maybe Integer
 foldConst e = case exNode e of
   EInt n _ -> Just n
-  EChar n -> Just n
+  EChar n _ -> Just n
   ECast _ x -> foldConst x
   EUnary op x -> do
     v <- foldConst x
@@ -510,11 +521,18 @@ checkExpr :: Expr -> Sema Expr
 checkExpr e = case exNode e of
   EInt _ suf -> pure (setTy (intLitType suf) e)
   EFloat _ isF -> pure (setTy (if isF then TFloat else TDouble) e)
-  EChar _ -> pure (setTy TInt e) -- C promotes character literals to int
-  EString s ->
+  -- C promotes a plain character literal to int; a wide one has type wchar_t,
+  -- which is what makes sizeof(L'a') two rather than four.
+  EChar _ False -> pure (setTy TInt e)
+  EChar _ True -> pure (setTy wcharType e)
+  EString str False ->
     -- char[N], not char*: sizeof("ab") is 3. Use sites that want a pointer
     -- get one from the usual decay.
-    pure (setTy (TArray TChar (length s + 1) AFixed) e)
+    pure (setTy (TArray TChar (length str + 1) AFixed) e)
+  -- A wide literal is an array of wchar_t, and its length is code units, not
+  -- source bytes: `L"你"` is three bytes of UTF-8 and one unit.
+  EString str True ->
+    pure (setTy (TArray wcharType (length (utf16Units str) + 1) AFixed) e)
   EIdent name _ -> checkIdent e name
   EBinary op l r -> checkBinary e op l r
   EUnary op x -> checkUnary e op x
@@ -1012,7 +1030,9 @@ inferArrayLen d = case (dType d, dInit d) of
 
 -- | The element count an initializer implies for an unsized array.
 initArrayLen :: Init -> Maybe Int
-initArrayLen (IExpr x) | EString s <- exNode x = Just (length s + 1)
+initArrayLen (IExpr x)
+  | EString str False <- exNode x = Just (length str + 1)
+  | EString str True <- exNode x = Just (length (utf16Units str) + 1)
 initArrayLen (IList items) = Just (foldl' step 0 (zip [0 ..] items))
   where
     -- a designated [k] = ... resets the running index, as in C
@@ -1081,6 +1101,10 @@ checkDecl isGlobal d0 = case dStorage d0 of
             }
         when (isGlobal || isStatic) (addGlobal sid)
         pure sid
+    -- A volatile object is read from memory every time it is named, so it
+    -- needs a home rather than a register. That is what carries its value
+    -- across a longjmp, which restores every register but no memory.
+    when (dVolatile d2) $ modifySym sid (\s -> s {symAddrTaken = True})
     ini <- mapM checkInit (dInit d2)
     pure d2 {dSym = Just sid, dInit = ini, dVlaBounds = vla'}
 
@@ -1147,16 +1171,19 @@ declareDecl d = case dStorage d of
             isStatic = dStorage d' == ScStatic
             isExtern = not isStatic && dStorage d' == ScExtern
             defining = not isExtern
-        sid <- insertSym SymVar (dName d') (dType d') (dLoc d') isExtern
+            hasInit = isJust (dInit d')
+        sid <- insertSymInit SymVar (dName d') (dType d') (dLoc d') isExtern hasInit
         old <- getSym sid
         tc <- tcGet
         -- The same object is typically declared `extern` in a header, included
         -- by many units, and defined once. The definition is authoritative:
         -- it decides both linkage and the type, since the header's declaration
-        -- may leave an array bound off (`extern int t[];`).
+        -- may leave an array bound off (`extern int t[];`). A tentative
+        -- definition may leave it off too, so take whichever type is complete
+        -- rather than whichever came last.
         let defined = symIsDefined old || defining
             ty
-              | defining = dType d'
+              | typeIsComplete tc (dType d') = dType d'
               | typeIsComplete tc (symType old) = symType old
               | otherwise = dType d'
         modifySym sid $ \s ->
@@ -1164,6 +1191,7 @@ declareDecl d = case dStorage d of
             { symIsGlobal = True
             , symIsStatic = isStatic
             , symIsDefined = defined
+            , symHasInit = symHasInit s || hasInit
             , symIsExtern = not defined
             , symType = ty
             , symLinkName = dName d'

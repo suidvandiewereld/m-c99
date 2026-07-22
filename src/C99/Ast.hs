@@ -133,8 +133,10 @@ data ExprNode
   = EInt !Integer IntSuffix
   | -- | Value, and whether an @f@ suffix made it a float rather than a double.
     EFloat !Double !Bool
-  | EChar !Integer
-  | EString String
+  | -- | Value, and whether an @L@ prefix made it a wchar_t.
+    EChar !Integer !Bool
+  | -- | Text as written, and whether an @L@ prefix made it wide.
+    EString String !Bool
   | -- | The SymId is filled by sema.
     EIdent String (Maybe SymId)
   | EBinary BinOp Expr Expr
@@ -221,6 +223,11 @@ data Decl = Decl
   , dInit :: Maybe Init
   , -- | GCC asm label: @int f() __asm__("real_name")@ overrides the link name.
     dAsmLabel :: Maybe String
+  , -- | The declaration specifiers said @volatile@. The type system drops
+    -- qualifiers, but this one has to reach the symbol: a volatile object
+    -- lives in memory and is read back from it every time, which is what
+    -- makes it survive a longjmp (C99 7.13.2.1p3).
+    dVolatile :: !Bool
   , -- | Every array bound in this declarator that did not fold to a constant,
     -- outermost first, keyed by the id the type carries. Lowering evaluates
     -- each once when the declaration is reached.
@@ -291,6 +298,10 @@ data Symbol = Symbol
   , -- | Internal linkage.
     symIsStatic :: !Bool
   , symIsDefined :: !Bool
+  , -- | A definition with an initializer has been seen. C99 6.9.2 lets a file
+    -- scope object be declared over and over with no initializer, each one a
+    -- tentative definition; only a second initializer is a redefinition.
+    symHasInit :: !Bool
   , -- | @&x@ appears somewhere, so x needs addressable storage rather than
     -- living in a register.
     symAddrTaken :: !Bool

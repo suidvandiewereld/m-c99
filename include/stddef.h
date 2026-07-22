@@ -4,7 +4,8 @@
 
 typedef long long ptrdiff_t;
 typedef unsigned long long size_t;
-typedef int wchar_t;
+/* 16 bits, as on every Windows toolchain: a wide literal is UTF-16. */
+typedef unsigned short wchar_t;
 
 #define NULL ((void *)0)
 

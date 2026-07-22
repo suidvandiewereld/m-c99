@@ -224,6 +224,8 @@ rtSources =
   , "rt_scan.c"
   , "rt_math.c"
   , "rt_os.c"
+  , "rt_jmp.c"
+  , "rt_wstring.c"
   ]
 
 -- | rt/ from the working directory first (running inside the repo), then

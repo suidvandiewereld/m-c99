@@ -321,12 +321,13 @@ lexChar = do
     then void advance
     else err start "unterminated character literal"
   -- C's plain char is signed here, but the value is taken as an unsigned byte,
-  -- matching lex_char's (unsigned char) cast.
+  -- matching lex_char's (unsigned char) cast. A wide literal keeps the whole
+  -- code point; the caller marks it and sema narrows it to wchar_t.
   pure
     emptyToken
       { tokKind = TkChar
       , tokLoc = start
-      , tokIVal = fromIntegral (ord ch `mod` 256)
+      , tokIVal = fromIntegral (ord ch)
       }
 
 lexNumber :: Lex Token
@@ -452,6 +453,10 @@ next = do
       c2 <- peek2C
       case () of
         _
+          -- `L'x'` and `L"..."`: the prefix binds to the literal, not to an
+          -- identifier that happens to be one letter long.
+          | c == 'L' && c2 == '\'' -> advance >> (wide <$> lexChar)
+          | c == 'L' && c2 == '"' -> advance >> (wide <$> lexString)
           | isIdentStart c -> do
               s <- takeWhileL isIdentCont
               pure
@@ -465,6 +470,12 @@ next = do
           | c == '"' -> lexString
           | c == '\'' -> lexChar
           | otherwise -> punct start
+
+-- | Mark a literal token as wide. The lexer keeps the text as written and
+-- lets sema decode it, because the width of a wchar_t is the type system's
+-- business rather than the scanner's.
+wide :: Token -> Token
+wide t = t {tokWide = True}
 
 -- | Punctuators, longest match first.
 punct :: SrcLoc -> Lex Token

@@ -64,6 +64,7 @@ flowchart LR
         direction TB
         ALLOC["rt_alloc.c<br/>malloc on HeapAlloc"]
         STDIO["rt_stdio.c<br/>FILE, buffering, fopen,<br/>_popen and _pclose"]
+        WSTR["rt_wstring.c / rt_jmp.c<br/>wcslen, wcscmp ...,<br/>setjmp and longjmp"]
         FMT["rt_format.c<br/>printf: exact float digits<br/>by base-1e9 bignum"]
         SCAN["rt_scan.c<br/>scanf, strtod as the<br/>same bignum reversed"]
         STR["rt_string.c / rt_ctype.c<br/>memcpy, strcmp, isalpha ..."]
@@ -96,9 +97,9 @@ Alongside the self-host loop:
 
 ```mermaid
 flowchart TD
-    CC["bin/c99mtlc.exe"] --> DIFF["<b>differential suite</b><br/>tests/diff, 47 cases<br/>gcc is the oracle, -O0 and -O1<br/>all pass"]
+    CC["bin/c99mtlc.exe"] --> DIFF["<b>differential suite</b><br/>tests/diff, 51 cases<br/>gcc is the oracle, -O0 and -O1<br/>all pass"]
     CC --> UNIT["<b>unit suite</b><br/>tests/run_suite.ps1<br/>codegen + diagnostics, all pass"]
-    CC --> CTS["<b>c-testsuite</b><br/>220 single-exec programs<br/>199 pass"]
+    CC --> CTS["<b>c-testsuite</b><br/>220 single-exec programs<br/>204 pass"]
     CC --> REAL["<b>real code</b><br/>cJSON and tinyexpr match gcc<br/>byte for byte at both levels"]
 ```
 
@@ -151,7 +152,7 @@ flowchart TD
     ROOT["C99Mettle/"] --> APP["app/Main.hs<br/>the driver: arguments, unit merging,<br/>rt injection, the link"]
     ROOT --> SRCD["src/C99/<br/>the frontend, one module per stage"]
     ROOT --> BIND["src/Mtlc.hs + cbits/<br/>the libmtlc binding"]
-    ROOT --> RTD["rt/<br/>c99rt, eleven C files"]
+    ROOT --> RTD["rt/<br/>c99rt, thirteen C files"]
     ROOT --> INC["include/<br/>the standard headers"]
     ROOT --> LIB["libmtlc/<br/>vendored backend:<br/>headers + mtlc.lib"]
     ROOT --> TST["tests/<br/>unit suite, differential suite,<br/>the self-contained runtime gate"]
@@ -207,14 +208,32 @@ not. Each has a differential test.
   TLS), and `-Wno-thread-local` accepts that for single-threaded programs.
 - Any byte sequence in a source file survives being quoted in a diagnostic.
   An accented word in a comment cannot crash the compiler.
+- Tentative definitions. `int x;` at file scope may be written as often as you
+  like, and only a second initializer is a redefinition (C99 6.9.2).
+- `volatile` puts an object in memory and reads it back from there every time,
+  which is what carries it across a longjmp.
+- Wide characters. `L'x'` and `L"..."` are wchar_t, sixteen bits as on every
+  Windows toolchain, so a literal is decoded from the source's UTF-8 and
+  re-encoded as UTF-16.
+- setjmp and longjmp, on the machine state kernel32 already knows how to save
+  and restore. No assembly, and nothing in the runtime has to know which
+  registers the ABI calls callee-saved.
+- An enumerator is a constant-expression, so `A = sizeof(int) + FLAG` folds.
 
 ## Known limits
 
-- A struct member whose array bound is a `sizeof` expression the parse-time
-  folder cannot evaluate stays incomplete and lands at offset 0. The fix is
-  to keep member bound expressions and fold them in sema.
+- A struct member whose array bound is `sizeof` applied to an OBJECT, as in
+  `int mix[sizeof(K) / sizeof(K[0])];`, stays incomplete and lands at offset
+  0. The parse-time folder knows the size of a type name but not of a name it
+  has never typed. The fix is to keep member bound expressions and fold them
+  in sema, where object types are known.
+- SQLite's amalgamation compiles clean, and a program that links it runs. Its
+  Win32 VFS does not build yet: `include/windows.h` is missing about thirty
+  of the file APIs it calls, so the build wants `-DSQLITE_OS_OTHER=1` and a
+  VFS of its own.
+- cJSON's unity test runner compiles now that setjmp exists, but linking it
+  with cJSON hits a backend limit while emitting `cJSON_Delete`. cJSON's own
+  test program is unaffected and still matches gcc.
 - `sizeof(int[n])` and casts to variably modified types are rejected with a
   clear error: a type name is not a declaration, so nothing evaluates its
   bounds.
-- No `setjmp.h`, no wide characters, no tentative definitions yet. Each is
-  diagnosed, never miscompiled.

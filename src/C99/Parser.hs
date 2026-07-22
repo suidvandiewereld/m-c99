@@ -339,8 +339,8 @@ parsePrimary = do
               (if tokLongLong t then 2 else if tokLong t then 1 else 0)
       pure (mkExpr loc (EInt (tokIVal t) suf))
     TkFloat -> advance >> pure (mkExpr loc (EFloat (tokFVal t) (tokFloatSuf t)))
-    TkChar -> advance >> pure (mkExpr loc (EChar (tokIVal t)))
-    TkString -> advance >> pure (mkExpr loc (EString (tokText t)))
+    TkChar -> advance >> pure (mkExpr loc (EChar (tokIVal t) (tokWide t)))
+    TkString -> advance >> pure (mkExpr loc (EString (tokText t) (tokWide t)))
     TkIdent -> advance >> pure (mkExpr loc (EIdent (tokText t) Nothing))
     TkLParen -> do
       advance
@@ -552,7 +552,7 @@ parseExpr = parseAssign >>= go
 foldConst :: Expr -> P (Maybe Integer)
 foldConst e = case exNode e of
   EInt v _ -> pure (Just v)
-  EChar v -> pure (Just v)
+  EChar v _ -> pure (Just v)
   EIdent n _ -> lookupEnum n
   EUnary op a -> do
     v <- foldConst a
@@ -620,80 +620,6 @@ foldConst e = case exNode e of
 
 -- ---- integer constant expressions (enumerator values) ----
 
-parseConstPrimary :: P Integer
-parseConstPrimary = do
-  t <- cur
-  case tokKind t of
-    TkInt -> advance >> pure (tokIVal t)
-    TkChar -> advance >> pure (tokIVal t)
-    TkLParen -> do
-      advance
-      v <- parseConstOr
-      expect TkRParen
-      pure v
-    TkIdent -> do
-      v <- lookupEnum (tokText t)
-      advance
-      pure (fromMaybe 0 v)
-    _ -> do
-      perr (tokLoc t) "expected integer constant expression"
-      advance
-      pure 0
-
-parseConstUnary :: P Integer
-parseConstUnary = do
-  k <- curKind
-  case k of
-    TkPlus -> advance >> parseConstUnary
-    TkMinus -> advance >> (negate <$> parseConstUnary)
-    TkTilde -> advance >> (complement <$> parseConstUnary)
-    TkBang -> advance >> (asBool . (== 0) <$> parseConstUnary)
-    _ -> parseConstPrimary
-  where
-    asBool b = if b then 1 else 0
-
-parseConstMul :: P Integer
-parseConstMul = parseConstUnary >>= go
-  where
-    go v = do
-      k <- curKind
-      case k of
-        TkStar -> advance >> parseConstUnary >>= \r -> go (v * r)
-        TkSlash -> advance >> parseConstUnary >>= \r -> go (if r == 0 then 0 else v `quot` r)
-        TkPercent -> advance >> parseConstUnary >>= \r -> go (if r == 0 then 0 else v `rem` r)
-        _ -> pure v
-
-parseConstAdd :: P Integer
-parseConstAdd = parseConstMul >>= go
-  where
-    go v = do
-      k <- curKind
-      case k of
-        TkPlus -> advance >> parseConstMul >>= \r -> go (v + r)
-        TkMinus -> advance >> parseConstMul >>= \r -> go (v - r)
-        _ -> pure v
-
-parseConstShift :: P Integer
-parseConstShift = parseConstAdd >>= go
-  where
-    go v = do
-      k <- curKind
-      case k of
-        TkLShift -> advance >> parseConstAdd >>= \r -> go (v `shiftL` fromInteger (r .&. 63))
-        TkRShift -> advance >> parseConstAdd >>= \r -> go (v `shiftR` fromInteger (r .&. 63))
-        _ -> pure v
-
-parseConstOr :: P Integer
-parseConstOr = parseConstShift >>= go
-  where
-    go v = do
-      k <- curKind
-      case k of
-        TkAmp -> advance >> parseConstShift >>= \r -> go (v .&. r)
-        TkCaret -> advance >> parseConstShift >>= \r -> go (v `xor` r)
-        TkPipe -> advance >> parseConstShift >>= \r -> go (v .|. r)
-        _ -> pure v
-
 -- ---- types ----
 
 optIdentName :: P (Maybe String)
@@ -726,7 +652,7 @@ parseStructOrUnion isUnion = do
         else do
           before <- gets psPos
           loc <- curLoc
-          (base, _, saw, _) <- parseDeclSpecs
+          (base, _, saw, _, _) <- parseDeclSpecs
           if not saw
             then do
               perr loc "expected member declaration"
@@ -769,6 +695,19 @@ parseStructOrUnion isUnion = do
           perr (tokLoc t) "expected bit-field width"
           pure 0
 
+-- | One enumerator's value: a constant-expression, folded. Falls back to the
+-- running counter when it does not fold, having said so.
+enumValue :: Integer -> P Integer
+enumValue nextVal = do
+  loc <- curLoc
+  e <- parseCond
+  mv <- foldConst e
+  case mv of
+    Just v -> pure v
+    Nothing -> do
+      perr loc "expected integer constant expression"
+      pure nextVal
+
 parseEnum :: P (Type, [(String, Integer)])
 parseEnum = do
   advance -- enum
@@ -791,7 +730,11 @@ parseEnum = do
           idt <- cur
           expect TkIdent
           hasVal <- match TkAssign
-          v <- if hasVal then parseConstOr else pure val
+          -- An enumerator is a constant-expression, so parse one properly and
+          -- fold it. The little integer-only parser this used to call knew
+          -- nothing of sizeof or casts, which is why
+          -- `A = sizeof(int) + FLAG` was rejected outright.
+          v <- if hasVal then enumValue val else pure val
           let name = tokText idt
           registerEnum name v
           more <- match TkComma
@@ -830,12 +773,13 @@ data Specs = Specs
   , spSc :: !StorageClass
   , spSaw :: !Bool
   , spEnums :: [(String, Integer)]
+  , spVolatile :: !Bool
   }
 
 -- | Returns the base type, the storage class, whether any type specifier was
 -- seen at all, and the enumerators of an enum defined here.
-parseDeclSpecs :: P (Type, StorageClass, Bool, [(String, Integer)])
-parseDeclSpecs = go (Specs BsNone Nothing False False 0 0 False ScNone False [])
+parseDeclSpecs :: P (Type, StorageClass, Bool, [(String, Integer)], Bool)
+parseDeclSpecs = go (Specs BsNone Nothing False False 0 0 False ScNone False [] False)
   where
     go sp = do
       k <- curKind
@@ -852,7 +796,7 @@ parseDeclSpecs = go (Specs BsNone Nothing False False 0 0 False ScNone False [])
           go sp
         TkInline -> advance >> go sp
         TkConst -> advance >> go sp
-        TkVolatile -> advance >> go sp
+        TkVolatile -> advance >> go sp {spVolatile = True}
         TkRestrict -> advance >> go sp
         TkVoid -> advance >> go sp {spBase = BsVoid, spSaw = True}
         TkCharKw -> advance >> go sp {spBase = BsChar, spSaw = True}
@@ -889,7 +833,7 @@ parseDeclSpecs = go (Specs BsNone Nothing False False 0 0 False ScNone False [])
               go sp {spBase = BsTag, spTag = Just ty, spSaw = True}
         _ -> finish sp
 
-    finish sp = pure (complexify sp (baseTy sp), spSc sp, spSaw sp, spEnums sp)
+    finish sp = pure (complexify sp (baseTy sp), spSc sp, spSaw sp, spEnums sp, spVolatile sp)
 
     baseTy sp = case spBase sp of
       BsNone -> intLike sp
@@ -1099,7 +1043,7 @@ parseParamList ret = do
       if ell
         then finish acc True
         else do
-          (bs, _, saw, _) <- parseDeclSpecs
+          (bs, _, saw, _, _) <- parseDeclSpecs
           (pt0, pname, _, vb) <- parseDeclaratorVla (if saw then bs else TInt)
           let p = Param (fromMaybe "" pname) (typeDecay pt0) vb Nothing
           more <- match TkComma
@@ -1141,7 +1085,7 @@ parseAbstractDeclarator base0 = do
 
 parseTypeName :: P Type
 parseTypeName = do
-  (base, _, saw, _) <- parseDeclSpecs
+  (base, _, saw, _, _) <- parseDeclSpecs
   parseAbstractDeclarator (if saw then base else TInt)
 
 -- ---- initializers ----
@@ -1342,8 +1286,8 @@ parseAsmLabel = do
 
 -- | The declarator list of one declaration: everything after the specifiers, up
 -- to but not including the ';'.
-declSeq :: Bool -> SrcLoc -> Type -> StorageClass -> (Type, Maybe String, [(Int, Expr)]) -> P [Decl]
-declSeq wantVla loc base sc first = go first []
+declSeq :: Bool -> Bool -> SrcLoc -> Type -> StorageClass -> (Type, Maybe String, [(Int, Expr)]) -> P [Decl]
+declSeq vol wantVla loc base sc first = go first []
   where
     go (ty, mname, vla) acc = do
       let name = fromMaybe "" mname
@@ -1359,6 +1303,7 @@ declSeq wantVla loc base sc first = go first []
               , dStorage = sc
               , dInit = ini
               , dAsmLabel = lbl
+              , dVolatile = vol
               , dVlaBounds = vla
               , dSym = Nothing
               }
@@ -1407,7 +1352,7 @@ parseDeclOrStmt = do
     then BIStmt <$> parseStmt
     else do
       loc <- curLoc
-      (base, sc, saw, es) <- parseDeclSpecs
+      (base, sc, saw, es, vol) <- parseDeclSpecs
       if not saw && sc == ScNone
         then BIStmt <$> parseStmt
         else do
@@ -1430,7 +1375,7 @@ parseDeclOrStmt = do
                   pure (BIStmt body)
                 else do
                   pushPending (enumConsts base es)
-                  ds <- declSeq True loc base sc (ty, mname, vla)
+                  ds <- declSeq vol True loc base sc (ty, mname, vla)
                   expect TkSemi
                   pure (BIDecl ds)
 
@@ -1466,7 +1411,7 @@ topDecl = do
       synchronize
       pure []
     else do
-      (base, sc, _, es) <- parseDeclSpecs
+      (base, sc, _, es, vol) <- parseDeclSpecs
       semi <- check TkSemi
       if semi
         then do
@@ -1492,7 +1437,7 @@ topDecl = do
                       }
               pure (enumConsts base es ++ [TDFunc fd])
             else do
-              ds <- declSeq False loc base sc (ty, mname, [])
+              ds <- declSeq vol False loc base sc (ty, mname, [])
               expect TkSemi
               pure (enumConsts base es ++ map TDDecl ds)
   where

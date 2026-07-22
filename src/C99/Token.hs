@@ -123,6 +123,7 @@ data Token = Token
   , tokLong :: !Bool -- l suffix
   , tokLongLong :: !Bool -- ll suffix
   , tokFloatSuf :: !Bool -- f suffix: float rather than double
+  , tokWide :: !Bool -- L prefix on a character or string literal
   }
   deriving (Eq, Show)
 
@@ -139,6 +140,7 @@ emptyToken =
     , tokLong = False
     , tokLongLong = False
     , tokFloatSuf = False
+    , tokWide = False
     }
 
 -- | Keyword lookup; TkIdent when the spelling is not a keyword. The table is a

@@ -61,6 +61,13 @@ int GetExitCodeProcess(void *h, unsigned *code);
 int CreatePipe(void **read_end, void **write_end, void *sec, unsigned size);
 int SetHandleInformation(void *h, unsigned mask, unsigned flags);
 
+/* The machine state behind setjmp/longjmp. RtlCaptureContext records its
+ * CALLER's registers and resume point, which is why setjmp is a macro: called
+ * straight from the user's function, what it captures is that function's own
+ * frame, still live when longjmp arrives. RtlRestoreContext resumes there. */
+void RtlCaptureContext(void *ctx);
+void RtlRestoreContext(void *ctx, void *exception_record);
+
 /* The two Win32 structures CreateProcessA needs, spelled out rather than
  * poked at through a char array: `system` and `_popen` both fill one in, and
  * the second has to reach the std-handle fields at the end. */

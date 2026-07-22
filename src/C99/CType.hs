@@ -39,6 +39,7 @@ module C99.CType
   , typeIsPointerLike
   , typeIsAggregate
   , typeIsVM
+  , wcharType
     -- * Relations
   , typeEqual
   , typeCompatible
@@ -394,6 +395,12 @@ typeIsAggregate t = case t of
 -- | Is this type variably modified: does any array bound in it depend on a
 -- run-time value? Such a type has no compile-time size, so every place that
 -- scales by it has to compute the size instead of reading it off the type.
+-- | wchar_t. Two bytes here, as it is everywhere on Windows, so a wide
+-- literal is UTF-16 and `L"你"` is one unit rather than a code point in
+-- four bytes.
+wcharType :: Type
+wcharType = TUShort
+
 typeIsVM :: Type -> Bool
 typeIsVM t = case t of
   TArray e _ AFixed -> typeIsVM e
