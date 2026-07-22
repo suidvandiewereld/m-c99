@@ -365,16 +365,16 @@ static void emit_padded(Sink *k, char sign, char prefix_a, char prefix_b,
 static void emit_float(Sink *k, double x, char conv, Spec sp) {
   char dig[800];
   int len, decpt;
-  /* Initialized because they are filled in through their addresses below.
-   * A backend fault loses that write here: rt_unpack's `*neg = ...` does not
-   * reach this frame's slot, so an uninitialized `neg` made every positive
-   * number print with a minus sign, and only at -O1, and only when the stack
-   * happened to be dirty. See tests/diff/varargs_double.c and the note in the
-   * known-gaps memory; initializing is correct in its own right, but it is
-   * masking a real bug, not fixing it. */
-  int neg = 0;
-  unsigned long long m = 0;
-  int e2 = 0;
+  /* Filled in through their addresses by rt_unpack, deliberately without
+   * initializers: this very pattern once exposed a backend fault where a
+   * by-name read of an address-taken int loaded the whole 8-byte home and
+   * picked up stack residue above the callee's 4-byte store, so positive
+   * numbers printed with a minus sign. The fix and its regression live in
+   * the backend and tests/diff/outparam_stack_residue.c; staying
+   * uninitialized keeps this code a canary for that class of bug. */
+  int neg;
+  unsigned long long m;
+  int e2;
   int cls;
   int prec = sp.prec >= 0 ? sp.prec : 6;
   char body[800 + 32];
