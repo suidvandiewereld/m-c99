@@ -1108,8 +1108,15 @@ genExpr e = case exNode e of
     pure r'
   EComma l r -> genExpr l >> genExpr r
   ECompoundLit ty ini -> do
+    -- C99 6.7.8p21: a member the initializer does not mention is initialized
+    -- as an object with static storage duration, which means zero. The storage
+    -- is a fresh stack slot, so clear it first or `(T){0}` leaves every member
+    -- past the first holding whatever the frame last used it for. Mettle's own
+    -- lowering resets an IR instruction that way between emits, and the stale
+    -- operand pointer it kept crashed the compiler on `a && b`.
     sz <- sizeOf ty
     mem <- stackBytes (if sz == 0 then 8 else sz) Nothing
+    memZero mem (max 1 sz)
     genInitInto ty mem ini
     pure mem
   where
