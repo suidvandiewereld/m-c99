@@ -550,13 +550,15 @@ applyGlobalInit d = do
         g <- lift (globalRef fn name)
         v <- genInit1 ini
         lift (assign fn g v)
-      (_, Just ini)
-        | typeIsFloat ty -> do
-            -- a scalar floating global: 'declareVar' left it zero
-            g <- lift (globalRef fn name)
-            v <- genInit1 ini
-            v' <- castTo v (initType ini) ty
-            lift (assign fn g v')
+      (_, Just ini) -> do
+        -- Any scalar 'declareVar' could not fold into the declaration: a
+        -- floating value, and any integer that is not a bare literal. `-1` is
+        -- a negation of 1, so `int g = -1;` came through here and used to fall
+        -- off the end of this case and stay 0.
+        g <- lift (globalRef fn name)
+        v <- genInit1 ini
+        v' <- castTo v (initType ini) ty
+        lift (assign fn g v')
       _ -> pure ()
   where
     initType (IExpr e) = fromMaybe TInt (exTy e)
@@ -2180,6 +2182,15 @@ declareVar d
                     -- 'builderGlobal' takes an integer constant, so a floating
                     -- initializer cannot ride along with the declaration: it
                     -- would be truncated to 0. Let the constructor assign it.
+                    t <- mtlcOf ty
+                    lift (builderGlobal b name t 0 isExtern)
+                    modify' $ \s -> s {lsGlobalInits = lsGlobalInits s ++ [d]}
+              (_, Just ini)
+                -- Anything the literal pattern below cannot read is not zero:
+                -- `-1` is a negation of 1, not the integer -1, and reading it
+                -- as one silently started every `static long long x = -1;` at
+                -- 0. Hand it to the constructor, which evaluates it properly.
+                | not (isIntLit ini) -> do
                     t <- mtlcOf ty
                     lift (builderGlobal b name t 0 isExtern)
                     modify' $ \s -> s {lsGlobalInits = lsGlobalInits s ++ [d]}
