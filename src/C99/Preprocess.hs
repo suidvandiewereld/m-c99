@@ -4,6 +4,7 @@
 -- line markers so the lexer can attribute tokens to the header they came from.
 module C99.Preprocess
   ( PPOptions (..)
+  , PPDef (..)
   , PPCache
   , newPPCache
   , defaultPPOptions
@@ -26,13 +27,20 @@ import System.Directory (doesFileExist)
 
 data PPOptions = PPOptions
   { ppIncludeDirs :: [FilePath]
-  , ppDefines :: [(String, String)]
+  , -- | @-D@ and @-U@ in command-line order, applied over the predefined
+    -- macros before the file is read.
+    ppDefines :: [PPDef]
   , -- | Share one cache (see 'newPPCache') across the translation units of a
     -- run and every header is read and resolved once instead of once per TU.
     -- 'Nothing' disables caching. A cache assumes the include dirs it serves
     -- are fixed, so do not share one between differently-configured options.
     ppCache :: Maybe PPCache
   }
+
+-- | A command-line macro request. @PPDefine@ carries the text as it would
+-- follow @#define@, with @-DFOO@ already turned into @FOO 1@.
+data PPDef = PPDefine String | PPUndef String
+  deriving (Eq, Show)
 
 defaultPPOptions :: PPOptions
 defaultPPOptions = PPOptions {ppIncludeDirs = [], ppDefines = [], ppCache = Nothing}
@@ -203,7 +211,21 @@ eSkip s = case dropWhile isSpaceTab s of
   s' -> s'
 
 evalExpr :: Table -> String -> Int64
-evalExpr tbl s = fst (eOr tbl s)
+evalExpr tbl s = fst (eCond tbl s)
+
+-- | @?:@, right associative. Both arms are parsed either way: the text has to
+-- be consumed for the caller to find what follows, and @#if@ operands are pure.
+eCond :: Table -> String -> E
+eCond tbl s0 = case eOr tbl s0 of
+  (c, s) -> case eSkip s of
+    ('?' : r) ->
+      let (t, r1) = eCond tbl r
+          r2 = case eSkip r1 of
+            (':' : r') -> r'
+            r' -> r'
+          (f, r3) = eCond tbl r2
+       in (if c /= 0 then t else f, r3)
+    s' -> (c, s')
 
 eOr :: Table -> String -> E
 eOr tbl s0 = loop (eAnd tbl s0)
@@ -299,7 +321,7 @@ ePrimary :: Table -> String -> E
 ePrimary tbl s0 = case eSkip s0 of
   [] -> (0, [])
   ('(' : r) ->
-    let (v, r') = eOr tbl r
+    let (v, r') = eCond tbl r
      in (v, dropChar ')' (eSkip r'))
   ('!' : r) -> let (v, r') = ePrimary tbl r in (bool (v == 0), r')
   ('~' : r) -> let (v, r') = ePrimary tbl r in (complement v, r')
@@ -415,6 +437,21 @@ scanBlockComment ('*' : '/' : r) = ("*/", r)
 scanBlockComment (c : r@(_ : _)) = let (a, r') = scanBlockComment r in (c : a, r')
 scanBlockComment s = ("", s)
 
+-- | Does this text end with a block comment still open? Strings, character
+-- constants and @\/\/@ comments cannot open one.
+endsInComment :: String -> Bool
+endsInComment = out
+  where
+    out [] = False
+    out ('/' : '/' : _) = False
+    out ('/' : '*' : r) = inC r
+    out (q : r)
+      | q == '"' || q == '\'' = out (snd (scanLit q r))
+    out (_ : r) = out r
+    inC [] = True
+    inC ('*' : '/' : r) = out r
+    inC (_ : r) = inC r
+
 -- | As 'scanBlockComment', but for a line that *starts* inside the comment: an
 -- unterminated comment swallows the whole line.
 scanOpenComment :: String -> (String, String)
@@ -519,8 +556,26 @@ expandLine' active tbl path line input startInComment
             case dropWhile isSpaceTab r of
               ('(' : r1) ->
                 let (args, r2) = scanArgs r1
-                 in substMacro active tbl path line m args ++ go r2
+                    ex = substMacro active tbl path line m args
+                 in case pendingCall ex r2 of
+                      Just n -> go (n ++ r2)
+                      Nothing -> ex ++ go r2
               _ -> i ++ go r
+
+    -- C99 6.10.3.4p1 rescans a replacement together with the text that follows
+    -- it, so `CAT(A,B)(x)` calls the macro the paste just spelled. Only the
+    -- case that needs it is taken: the whole replacement is one identifier, it
+    -- names a function-like macro, and an argument list is waiting.
+    pendingCall ex r2 = case span isIdentCont (dropWhile isSpaceTab ex) of
+      (n@(c : _), tl)
+        | isIdentStart c
+        , all isSpaceTab tl
+        , n `notElem` active
+        , Just m2 <- macroFind tbl n
+        , mFunc m2
+        , ('(' : _) <- dropWhile isSpaceTab r2 ->
+            Just n
+      _ -> Nothing
 
     fwd '\\' = '/'
     fwd c = c
@@ -565,28 +620,58 @@ substMacro active tbl path line m args =
     argAt k = args !! k
 
     -- The accumulator is reversed so `##` can strip the whitespace it follows.
-    subst acc [] = reverse acc
-    subst acc ('#' : '#' : r) =
-      subst (dropWhile isSpaceTab acc) (dropWhile isSpaceTab r)
-    subst acc ('#' : r) =
-      let r1 = dropWhile isSpaceTab r
-       in case readIdent r1 of
-            (Just pname, r2) -> case paramIndex pname of
-              Just k | k < nargs -> subst (revApp (stringifyArg (argAt k)) acc) r2
-              _ -> subst acc r2
-            (Nothing, r2) -> subst acc r2
-    subst acc s@(c : r)
-      | isIdentStart c =
-          let (i, r') = span isIdentCont s
-           in case paramIndex i of
-                Just k | k < nargs -> subst (revApp (argAt k) acc) r'
-                _
-                  | mVariadic m && i == "__VA_ARGS__" ->
-                      subst (revApp (intercalate "," (drop fixed args)) acc) r'
-                  | otherwise -> subst (revApp i acc) r'
-      | otherwise = subst (c : acc) r
+    --
+    -- Substitution is textual, so a spliced argument can run into what sits
+    -- beside it and lex as one token neither side wrote: `#define Q(A) A+`
+    -- with `Q(+)` must give `+ +`, not `++`. A boundary therefore goes in
+    -- wherever two spliced-in pieces would fuse. @##@ exists to erase exactly
+    -- that boundary, so it sets @fuse@ for the splice it introduces.
+    subst = go False False
+      where
+        go _ _ acc [] = reverse acc
+        go _ _ acc ('#' : '#' : r) =
+          go False True (dropWhile isSpaceTab acc) (dropWhile isSpaceTab r)
+        go _ fu acc ('#' : r) =
+          let r1 = dropWhile isSpaceTab r
+           in case readIdent r1 of
+                (Just pname, r2) -> case paramIndex pname of
+                  Just k | k < nargs -> splice fu (stringifyArg (argAt k)) acc r2
+                  _ -> go True False acc r2
+                (Nothing, r2) -> go True False acc r2
+        go sp fu acc s@(c : r)
+          | isIdentStart c =
+              let (i, r') = span isIdentCont s
+               in case paramIndex i of
+                    Just k | k < nargs -> splice fu (argAt k) acc r'
+                    _
+                      | mVariadic m && i == "__VA_ARGS__" ->
+                          splice fu (intercalate "," (drop fixed args)) acc r'
+                      -- A body token is spelled as the author wrote it, and
+                      -- text alone cannot butt two of them together, so it
+                      -- never needs a boundary. After `##` it must not get one.
+                      | otherwise -> go False False (revApp i acc) r'
+          -- body punctuation is already spelled the way the author meant it,
+          -- so it only needs a boundary when it lands against a splice
+          | sp, (a : _) <- acc, fuses a c = go False False (c : ' ' : acc) r
+          | otherwise = go False False (c : acc) r
+
+        splice fu txt acc r = case (acc, txt) of
+          (a : _, b : _) | not fu, fuses a b -> go True False (revApp txt (' ' : acc)) r
+          _ -> go True False (revApp txt acc) r
 
     revApp s acc = foldl' (flip (:)) acc s
+
+-- | Would these two characters lex as one token if they met? Identifier and
+-- number characters run together, and so do the punctuators that pair up.
+fuses :: Char -> Char -> Bool
+fuses a b
+  | isIdentCont a && isIdentCont b = True
+  | isDigit a && b == '.' = True
+  | a == '.' && isDigit b = True
+  | a `elem` punct && b `elem` punct = True
+  | otherwise = False
+  where
+    punct = "+-*/%<>=&|!^#." :: String
 
 -- ---- include search ----
 
@@ -723,8 +808,9 @@ ppLines :: FilePath -> [ByteString] -> Int -> Bool -> [ByteString] -> PPM [ByteS
 ppLines _ [] _ _ acc = return acc
 ppLines path (raw : rest) line inCmt acc
   | not inCmt, startsHashBS raw = do
-      acc' <- directive path (BS.unpack raw) line acc
-      ppLines path rest (line + 1) inCmt acc'
+      let (text, merged, rest') = mergeDirective (BS.unpack raw) rest 0
+      acc' <- directive path text line acc
+      ppLines path rest' (line + merged + 1) inCmt (replicate merged nlB ++ acc')
   | otherwise = do
       dis <- gets stDisabled
       if dis
@@ -767,6 +853,18 @@ anyCandidateBS tbl s = go 0
     end !j
       | j < n && isIdentCont (BS.index s j) = end (j + 1)
       | otherwise = j
+
+-- | A block comment opened on a directive line runs past the newline. Phase 3
+-- turns the whole comment into one space before phase 4 reads the directive, so
+-- the directive continues to wherever the comment closes. Absorb those lines,
+-- and let the caller emit blanks for them to keep physical line numbering.
+mergeDirective :: String -> [ByteString] -> Int -> (String, Int, [ByteString])
+mergeDirective text ls merged
+  | endsInComment text
+  , merged < 4096
+  , (nraw : rest) <- ls =
+      mergeDirective (text ++ "\n" ++ BS.unpack nraw) rest (merged + 1)
+  | otherwise = (text, merged, ls)
 
 -- | A function-like invocation may span physical lines: while the line leaves
 -- @(@ unbalanced, absorb following lines (directives stop the merge). Blank
@@ -900,25 +998,30 @@ directive path raw line acc = do
       | otherwise = t
 
 doDefine :: FilePath -> Int -> String -> PPM ()
-doDefine path line rest0 = case readIdent rest of
-  (Nothing, _) -> ppError path line "#define missing name"
-  (Just name, afterName) -> do
+doDefine path line rest = case parseDefine rest of
+  Nothing -> ppError path line "#define missing name"
+  Just m -> modify $ \s -> s {stMacros = macroDefine m (stMacros s)}
+
+-- | Parse the text after @#define@ into a macro. Shared with the driver, so
+-- @-DF(x)=x+1@ on the command line means exactly what the directive does.
+parseDefine :: String -> Maybe Macro
+parseDefine rest0 = case readIdent rest of
+  (Nothing, _) -> Nothing
+  (Just name, afterName) ->
     let (isFn, variadic, params, afterParams) = case afterName of
           ('(' : r) ->
             let (ps, va, r') = parseParams (dropWhile isSpaceTab r)
              in (True, va, ps, r')
           _ -> (False, False, [], afterName)
-        body = trimEnd (dropWhile isSpaceTab afterParams)
-        m =
+     in Just
           Macro
             { mName = name
             , mFunc = isFn
             , mVariadic = variadic
             , mParams = params
-            , mBody = body
+            , mBody = trimEnd (dropWhile isSpaceTab afterParams)
             , mPredef = False
             }
-    modify $ \s -> s {stMacros = macroDefine m (stMacros s)}
   where
     -- before the name, so a comment between the parameters goes too
     rest = stripComments rest0
@@ -1057,7 +1160,7 @@ preprocess opts path = do
     Just src -> do
       let st0 =
             St
-              { stMacros = foldl' (flip macroDefine) predefs (map cmdline (ppDefines opts))
+              { stMacros = foldl' cmdline predefs (ppDefines opts)
               , stIfStack = []
               , stDisabled = False
               , stIncludeStack = []
@@ -1068,5 +1171,5 @@ preprocess opts path = do
       (out, st) <- runStateT (ppBuffer path src) st0
       return (out, reverse (stMsgs st))
   where
-    -- `-DFOO` with no `=value` means 1, as it does for every other C compiler.
-    cmdline (n, v) = objMacro False n (if null v then "1" else v)
+    cmdline tbl (PPUndef n) = macroUndef n tbl
+    cmdline tbl (PPDefine t) = maybe tbl (`macroDefine` tbl) (parseDefine t)

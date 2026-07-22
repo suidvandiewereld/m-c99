@@ -21,7 +21,7 @@ import C99.Ast (Program, TopDecl (..), FuncDef (..))
 import C99.Lexer (tokenize)
 import C99.Lower (lowerProgram)
 import C99.Parser (parseProgram)
-import C99.Preprocess (PPOptions (..), newPPCache, preprocess)
+import C99.Preprocess (PPDef (..), PPOptions (..), newPPCache, preprocess)
 import C99.Runtime (u128RuntimeSrc)
 import C99.Sema (SemaResult (..), semaCheck)
 import C99.StaticRename (mangleStatics)
@@ -35,6 +35,7 @@ data Options = Options
   , optEmitIrOnly :: !Bool
   , optStaticPrefix :: String
   , optIncludes :: [FilePath]
+  , optDefines :: [PPDef]
   , optInputs :: [FilePath]
   , -- | @auto@ unless @--color=always@/@never@ forced it.
     optColor :: Maybe Bool
@@ -58,6 +59,7 @@ defaults =
     , optEmitIrOnly = False
     , optStaticPrefix = "st"
     , optIncludes = []
+    , optDefines = []
     , optInputs = []
     , optColor = Nothing
     , optNoWarn = []
@@ -78,6 +80,8 @@ usage = do
     , "Options:"
     , "  -o <path>     output executable (default: a.exe)"
     , "  -I <dir>      add include search path"
+    , "  -D <name>[=v] predefine a macro (v defaults to 1)"
+    , "  -U <name>     undefine a predefined macro"
     , "  -E            preprocess only (write to stdout)"
     , "  -O0/-O1/-O    optimization off / on"
     , "  -c            emit object only (.obj)"
@@ -120,7 +124,13 @@ warningsHelp =
     )
 
 parseArgs :: [String] -> Options -> IO Options
-parseArgs [] o = pure o {optInputs = reverse (optInputs o), optIncludes = reverse (optIncludes o)}
+parseArgs [] o =
+  pure
+    o
+      { optInputs = reverse (optInputs o)
+      , optIncludes = reverse (optIncludes o)
+      , optDefines = reverse (optDefines o)
+      }
 parseArgs (a : rest) o = case a of
   "-h" -> usage >> exitSuccess
   "--help" -> usage >> exitSuccess
@@ -136,6 +146,12 @@ parseArgs (a : rest) o = case a of
   "-I" -> case rest of
     (p : more) -> parseArgs more o {optIncludes = p : optIncludes o}
     [] -> fatal "missing argument for -I"
+  "-D" -> case rest of
+    (d : more) -> parseArgs more o {optDefines = define d : optDefines o}
+    [] -> fatal "missing argument for -D"
+  "-U" -> case rest of
+    (n : more) -> parseArgs more o {optDefines = PPUndef n : optDefines o}
+    [] -> fatal "missing argument for -U"
   "-E" -> parseArgs rest o {optPreprocessOnly = True}
   "-O0" -> parseArgs rest o {optOptLevel = 0}
   "-c" -> parseArgs rest o {optObjOnly = True}
@@ -145,6 +161,10 @@ parseArgs (a : rest) o = case a of
     | a `elem` ["-O", "-O1", "-O2", "-O3"] -> parseArgs rest o {optOptLevel = 1}
     | "-I" `isPrefixOf` a, length a > 2 ->
         parseArgs rest o {optIncludes = drop 2 a : optIncludes o}
+    | "-D" `isPrefixOf` a, length a > 2 ->
+        parseArgs rest o {optDefines = define (drop 2 a) : optDefines o}
+    | "-U" `isPrefixOf` a, length a > 2 ->
+        parseArgs rest o {optDefines = PPUndef (drop 2 a) : optDefines o}
     | a == "--no-rt" -> parseArgs rest o {optNoRt = True}
     | "--static-prefix=" `isPrefixOf` a ->
         parseArgs rest o {optStaticPrefix = drop 16 a}
@@ -166,6 +186,13 @@ parseArgs (a : rest) o = case a of
     | a == "-Wall" || a == "-Wextra" -> parseArgs rest o -- every group is already on
     | "-" `isPrefixOf` a -> fatal ("unknown option '" ++ a ++ "'")
     | otherwise -> parseArgs rest o {optInputs = a : optInputs o}
+
+-- | @-DNAME=body@ is the same text a @#define NAME body@ would carry, and a
+-- bare @-DNAME@ means 1, as it does for every other C compiler.
+define :: String -> PPDef
+define a = case break (== '=') a of
+  (n, '=' : v) -> PPDefine (n ++ " " ++ v)
+  _ -> PPDefine (a ++ " 1")
 
 fatal :: String -> IO a
 fatal msg = hPutStrLn stderr ("c99mtlc: " ++ msg) >> exitFailure
@@ -266,7 +293,7 @@ main = do
   let ppopt =
         PPOptions
           { ppIncludeDirs = optIncludes opts ++ ["include"]
-          , ppDefines = []
+          , ppDefines = optDefines opts
           , ppCache = Just cache
           }
 
