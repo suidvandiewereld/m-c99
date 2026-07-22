@@ -23,6 +23,7 @@ import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.State.Strict
 import Data.Bits (bit, complement, shiftL)
 import Data.Char (ord)
+import Data.List (foldl', nub)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word32, Word64)
@@ -41,6 +42,9 @@ data LowerState = LowerState
   , lsLabelId :: !Int
   , lsTmpId :: !Int
   , lsStrId :: !Int
+  , -- | Mixed into the names of the globals invented here, so two separately
+    -- compiled objects do not both call their first string literal @.str0@.
+    lsTag :: String
   , -- | Scalar locals and parameters: the value handle is the storage.
     lsLocals :: M.Map SymId Value
   , -- | Aggregate locals: the handle holds the object's base address. Reading
@@ -89,6 +93,7 @@ lowerProgram sr = do
           , lsLabelId = 0
           , lsTmpId = 0
           , lsStrId = 0
+          , lsTag = srTag sr
           , lsLocals = M.empty
           , lsPtrs = M.empty
           , lsStrings = M.empty
@@ -575,20 +580,29 @@ genInit1 (IList _) = do
 -- static duration.
 genString :: String -> Lower Value
 genString s = do
+  ptrname <- prepareString s
+  fn <- gets lsFn
+  lift (globalRef fn ptrname)
+
+-- | Intern a literal and make sure its pointer is filled in, without producing
+-- a value. This is what the entry-block pass wants: the check, and nothing to
+-- leave dangling in the IR.
+prepareString :: String -> Lower String
+prepareString s = do
   interned <- gets lsStrings
   ptrname <- case M.lookup s interned of
     Just p -> pure p
     Nothing -> newString s
   ensureString ptrname s
-  fn <- gets lsFn
-  lift (globalRef fn ptrname)
+  pure ptrname
 
 newString :: String -> Lower String
 newString s = do
   b <- gets lsBuilder
   n <- gets lsStrId
+  tag <- gets lsTag
   modify' $ \st -> st {lsStrId = n + 1}
-  let base = ".str" ++ show n
+  let base = ".str" ++ tag ++ "_" ++ show n
       bytes = map (fromIntegral . ord) s ++ [0] :: [Word64]
       words' = chunk8 bytes
   u64 <- u64L
@@ -606,7 +620,62 @@ newString s = do
           packed = sum [b' `shiftL` (8 * i) | (i, b') <- zip [0 ..] h]
        in packed : chunk8 t
 
+-- | Every string literal the body mentions, in order, without duplicates.
+--
+-- Lowering needs these before it emits the body: see 'ensureString'.
+stringsIn :: Stmt -> [String]
+stringsIn body = nub (stmt body)
+  where
+    stmt (Stmt _ n) = case n of
+      SExpr e -> expr e
+      SCompound items -> concatMap item items
+      SIf c a mb -> expr c ++ stmt a ++ maybe [] stmt mb
+      SWhile c b -> expr c ++ stmt b
+      SDo b c -> stmt b ++ expr c
+      SFor mi mc mp b ->
+        maybe [] item mi ++ maybe [] expr mc ++ maybe [] expr mp ++ stmt b
+      SReturn me -> maybe [] expr me
+      SSwitch e b -> expr e ++ stmt b
+      SCase e b -> expr e ++ stmt b
+      SDefault b -> stmt b
+      SLabel _ b -> stmt b
+      _ -> []
+
+    item (BIStmt st) = stmt st
+    item (BIDecl ds) = concatMap decl ds
+
+    decl d = concatMap (expr . snd) (dVlaBounds d) ++ maybe [] ini (dInit d)
+
+    ini (IExpr e) = expr e
+    ini (IList xs) = concatMap (\(md, i) -> maybe [] desig md ++ ini i) xs
+
+    desig (DIndex e) = expr e
+    desig _ = []
+
+    expr (Expr _ _ n) = case n of
+      EString str -> [str]
+      EBinary _ a b -> expr a ++ expr b
+      EUnary _ a -> expr a
+      EPostfix _ a -> expr a
+      EAssign _ a b -> expr a ++ expr b
+      ECall f as _ -> expr f ++ concatMap expr as
+      EIndex a b -> expr a ++ expr b
+      EMember a _ _ -> expr a
+      ECast _ a -> expr a
+      ESizeofExpr a -> expr a
+      ECond a b c -> expr a ++ expr b ++ expr c
+      EComma a b -> expr a ++ expr b
+      ECompoundLit _ i -> ini i
+      EBuiltin _ as _ -> concatMap expr as
+      _ -> []
+
 -- | Emit the first-use check for a string's pointer global, once per function.
+--
+-- The check has to run before any use, and a function entry is the only place
+-- that is true of: emitting it where the literal first appears puts it inside
+-- whatever branch that was, and a use in a sibling branch then reads a null
+-- pointer. That is what crashed 83 of Mettle's own tests, from a diagnostic
+-- renderer that spells the same format string in two arms of an @if@.
 ensureString :: String -> String -> Lower ()
 ensureString ptrname s = do
   ensured <- gets lsFnStrEnsured
@@ -2015,6 +2084,10 @@ genFunction fd = do
       when (needInit && fdName fd == "main") $ do
         void' <- lift (tyScalar Void)
         lift (callVoid fn "__c99m_init_globals" [] void')
+
+      -- Before the body: every literal it mentions, so the pointer is live on
+      -- every path rather than only the one that happened to be emitted first.
+      mapM_ prepareString (stringsIn (fdBody fd))
 
       genStmt (fdBody fd)
 

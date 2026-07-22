@@ -31,6 +31,10 @@ import C99.Diag (closestCandidate)
 
 data SemaResult = SemaResult
   { srProgram :: Program
+  , -- | A tag unique to this object, mixed into the names of the globals
+    -- lowering invents. Without it two separately compiled objects both call
+    -- their first string literal @.str0@ and the link silently keeps one.
+    srTag :: String
   , srSyms :: M.Map SymId Symbol
   , -- | Globals in declaration order: what the lowerer must emit.
     srGlobals :: [SymId]
@@ -63,8 +67,8 @@ data SemaState = SemaState
 
 type Sema a = State SemaState a
 
-semaCheck :: TypeContext -> Program -> SemaResult
-semaCheck tc prog =
+semaCheck :: String -> TypeContext -> Program -> SemaResult
+semaCheck tag tc prog =
   let st0 =
         SemaState
           { ssTc = tc
@@ -82,6 +86,7 @@ semaCheck tc prog =
       (prog', st) = runState (checkProgram prog) st0
    in SemaResult
         { srProgram = prog'
+        , srTag = tag
         , srSyms = ssSyms st
         , srGlobals = reverse (ssGlobals st)
         , srTc = ssTc st

@@ -6,7 +6,11 @@ module Main (main) where
 
 import Control.Monad (forM, unless, when)
 import qualified Data.ByteString.Char8 as BS
-import Data.List (isPrefixOf)
+import Data.Bits (xor)
+import Data.Char (ord)
+import Data.List (foldl', isPrefixOf)
+import Data.Word (Word64)
+import Numeric (showHex)
 import System.Directory (doesFileExist)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
@@ -194,6 +198,15 @@ define a = case break (== '=') a of
   (n, '=' : v) -> PPDefine (n ++ " " ++ v)
   _ -> PPDefine (a ++ " 1")
 
+-- | A short tag naming this object, so the globals the compiler invents for it
+-- do not collide with another object's. Everything in one run shares a tag,
+-- which is all that is needed: names are unique within the run already, and
+-- the output path is what tells two runs apart.
+objectTag :: FilePath -> String
+objectTag out = showHex (foldl' mix (0xcbf29ce484222325 :: Word64) out) ""
+  where
+    mix h c = (h `xor` fromIntegral (ord c)) * 0x100000001b3
+
 fatal :: String -> IO a
 fatal msg = hPutStrLn stderr ("c99mtlc: " ++ msg) >> exitFailure
 
@@ -351,7 +364,7 @@ compile sink opts ppopt = do
   (merged, tc1, sawI128, parseFailed) <-
     foldMTU (\i tc path -> do
       (prog, tc', saw, bad) <- parseTU sink ppopt tc path
-      pure (mangleStatics (optStaticPrefix opts) i prog, tc', saw, bad))
+      pure (mangleStatics (optStaticPrefix opts ++ objectTag output) i prog, tc', saw, bad))
       newTypeContext
       (zip [0 ..] inputs)
 
@@ -399,7 +412,7 @@ compile sink opts ppopt = do
 
   -- Check what parsed even when some of it did not. A syntax error and a type
   -- error in the same build should come out of the same run.
-  let sr = semaCheck tcRt mergedRt
+  let sr = semaCheck (objectTag output) tcRt mergedRt
   sinkReport sink (semaAfterParseErrors parseFailed (srMsgs sr))
   -- Ask the sink, not the message list: -Werror turns a warning into an error
   -- during reporting, which the pass that produced it cannot know.
