@@ -168,6 +168,10 @@ declaration. `__int128` never reaches the backend: the parser desugars it into
 a two-u64 struct, and any unit that mentions it pulls in one extra helper unit
 (`src/C99/Runtime.hs`).
 
+[docs/implementation.md](docs/implementation.md) goes through every stage in
+detail: what each pass does, why it is built the way it is, and which bug each
+odd-looking decision came from.
+
 To update the backend, build [MettleToolchain](../MettleToolchain/) and run
 `vendor-libmtlc.sh`, which copies the headers and `mtlc.lib` here, then
 rebuild so `cbits` recompiles against the new headers.
