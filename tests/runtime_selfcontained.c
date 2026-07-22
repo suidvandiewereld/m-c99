@@ -99,6 +99,36 @@ static int check_file(void) {
   return result;
 }
 
+/* A pipe to a child, which is the one part of the runtime that needs a whole
+   process to come and go. Only a cmd.exe builtin, so nothing has to be
+   installed for this to run. */
+static int check_pipe(void) {
+  char line[128];
+  FILE *p;
+  int lines = 0;
+
+  p = _popen("echo c99rt", "r");
+  if (!p)
+    return 40;
+  while (fgets(line, sizeof line, p))
+    lines++;
+  if (_pclose(p) != 0)
+    return 41;
+  if (lines != 1)
+    return 42;
+  if (strncmp(line, "c99rt", 5) != 0)
+    return 43;
+
+  p = _popen("exit /b 7", "r");
+  if (!p)
+    return 44;
+  while (fgets(line, sizeof line, p))
+    ;
+  if (_pclose(p) != 7)
+    return 45;
+  return 0;
+}
+
 int main(void) {
   int result = check_heap();
   if (!result)
@@ -107,5 +137,7 @@ int main(void) {
     result = check_math();
   if (!result)
     result = check_file();
+  if (!result)
+    result = check_pipe();
   return result;
 }

@@ -39,6 +39,7 @@ struct _C99MTLC_FILE {
   int pos;          /* read: next unread byte */
   int ungot;        /* one pushed-back byte, or -1 */
   int is_std;       /* never freed, never closed */
+  void *proc;       /* child process handle, for a _popen stream */
   struct _C99MTLC_FILE *next;
 };
 
@@ -46,6 +47,7 @@ typedef struct _C99MTLC_FILE FILE_;
 
 void *malloc(rt_size);
 void free(void *);
+char *getenv(const char *);
 void *memcpy(void *, const void *, rt_size);
 rt_size strlen(const char *);
 
@@ -292,6 +294,7 @@ FILE_ *fopen(const char *path, const char *mode) {
   f->pos = 0;
   f->ungot = -1;
   f->is_std = 0;
+  f->proc = RT_NULL;
 
   if (fmode & F_APPEND)
     SetFilePointerEx(h, 0, RT_NULL, 2 /*FILE_END*/);
@@ -311,6 +314,12 @@ int fclose(FILE_ *f) {
   if (f->is_std)
     return r;
   CloseHandle(f->h);
+  if (f->proc) {
+    /* fclose on a _popen stream still has to reap the child */
+    WaitForSingleObject(f->proc, 0xFFFFFFFFu);
+    CloseHandle(f->proc);
+    f->proc = RT_NULL;
+  }
   for (pp = &rt_open_files; *pp; pp = &(*pp)->next) {
     if (*pp == f) {
       *pp = f->next;
@@ -570,6 +579,145 @@ int _isatty(int fd) {
   else
     return 0;
   return GetFileType(h) == 2u; /* FILE_TYPE_CHAR */
+}
+
+/* ---- pipes to a child process ---- */
+
+/* _popen runs `command` through the shell and hands back one end of a pipe;
+ * _pclose closes it and reports what the child exited with. Only "r" and "w"
+ * are meaningful: a pipe carries one direction.
+ *
+ * The child must inherit its end of the pipe and must NOT inherit ours, or it
+ * holds the write end open and the reader never sees end-of-file. */
+static void rt_popen_cmdline(const char *command, char *out, rt_size cap) {
+  const char *shell = getenv("COMSPEC");
+  rt_size i, k = 0;
+
+  if (!shell)
+    shell = "cmd.exe";
+  for (i = 0; shell[i] && k + 8 < cap; i++)
+    out[k++] = shell[i];
+  out[k++] = ' ';
+  out[k++] = '/';
+  out[k++] = 'c';
+  out[k++] = ' ';
+  for (i = 0; command[i] && k + 1 < cap; i++)
+    out[k++] = command[i];
+  out[k] = 0;
+}
+
+FILE_ *_popen(const char *command, const char *mode) {
+  RtSecurityAttributes sa;
+  RtStartupInfoA si;
+  RtProcessInformation pi;
+  char cmdbuf[4096];
+  void *rd = RT_NULL, *wr = RT_NULL;
+  void *ours, *theirs;
+  FILE_ *f;
+  rt_size i;
+  int reading;
+
+  if (!command || !mode)
+    return RT_NULL;
+  if (mode[0] == 'r')
+    reading = 1;
+  else if (mode[0] == 'w')
+    reading = 0;
+  else
+    return RT_NULL;
+
+  rt_std_init();
+
+  sa.length = sizeof(sa);
+  sa.descriptor = RT_NULL;
+  sa.inherit_handle = 1;
+  if (!CreatePipe(&rd, &wr, &sa, 0))
+    return RT_NULL;
+
+  ours = reading ? rd : wr;
+  theirs = reading ? wr : rd;
+  /* our end stays in this process only */
+  SetHandleInformation(ours, RT_HANDLE_FLAG_INHERIT, 0);
+
+  for (i = 0; i < sizeof(si); i++)
+    ((char *)&si)[i] = 0;
+  for (i = 0; i < sizeof(pi); i++)
+    ((char *)&pi)[i] = 0;
+  si.cb = sizeof(si);
+  si.flags = RT_STARTF_USESTDHANDLES;
+  si.std_error = rt_stderr_file.h;
+  if (reading) {
+    si.std_input = rt_stdin_file.h;
+    si.std_output = theirs;
+  } else {
+    si.std_input = theirs;
+    si.std_output = rt_stdout_file.h;
+  }
+
+  rt_popen_cmdline(command, cmdbuf, sizeof(cmdbuf));
+  __c99m_stdio_flush_all();
+  if (!CreateProcessA(RT_NULL, cmdbuf, RT_NULL, RT_NULL, 1, 0, RT_NULL,
+                      RT_NULL, &si, &pi)) {
+    CloseHandle(rd);
+    CloseHandle(wr);
+    return RT_NULL;
+  }
+
+  /* the child owns its end now; holding a copy would hide end-of-file */
+  CloseHandle(theirs);
+  CloseHandle(pi.thread);
+
+  f = (FILE_ *)malloc(sizeof(FILE_));
+  if (!f) {
+    CloseHandle(ours);
+    WaitForSingleObject(pi.process, 0xFFFFFFFFu);
+    CloseHandle(pi.process);
+    return RT_NULL;
+  }
+  f->h = ours;
+  f->mode = reading ? F_READ : F_WRITE;
+  f->dir = DIR_IDLE;
+  f->err = 0;
+  f->eof = 0;
+  f->bufmode = BUF_FULL;
+  f->buf = (unsigned char *)malloc(RT_BUFSZ);
+  f->cap = f->buf ? RT_BUFSZ : 0;
+  f->len = 0;
+  f->pos = 0;
+  f->ungot = -1;
+  f->is_std = 0;
+  f->proc = pi.process;
+  f->next = rt_open_files;
+  rt_open_files = f;
+  return f;
+}
+
+int _pclose(FILE_ *f) {
+  FILE_ **pp;
+  unsigned code = 0;
+  void *proc;
+
+  if (!f)
+    return -1;
+  rt_flush_write(f);
+  proc = f->proc;
+  CloseHandle(f->h);
+  for (pp = &rt_open_files; *pp; pp = &(*pp)->next) {
+    if (*pp == f) {
+      *pp = f->next;
+      break;
+    }
+  }
+  free(f->buf);
+  free(f);
+
+  if (!proc)
+    return -1;
+  WaitForSingleObject(proc, 0xFFFFFFFFu);
+  if (!GetExitCodeProcess(proc, &code))
+    code = (unsigned)-1;
+  CloseHandle(proc);
+  return (int)code;
 }
 
 int _access(const char *path, int mode) {

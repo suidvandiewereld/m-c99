@@ -58,6 +58,43 @@ int CreateProcessA(const char *app, char *cmdline, void *pa, void *ta,
                    void *startupinfo, void *procinfo);
 unsigned WaitForSingleObject(void *h, unsigned ms);
 int GetExitCodeProcess(void *h, unsigned *code);
+int CreatePipe(void **read_end, void **write_end, void *sec, unsigned size);
+int SetHandleInformation(void *h, unsigned mask, unsigned flags);
+
+/* The two Win32 structures CreateProcessA needs, spelled out rather than
+ * poked at through a char array: `system` and `_popen` both fill one in, and
+ * the second has to reach the std-handle fields at the end. */
+typedef struct {
+  unsigned cb;
+  char *reserved;
+  char *desktop;
+  char *title;
+  unsigned x, y, x_size, y_size;
+  unsigned x_chars, y_chars, fill_attribute;
+  unsigned flags;
+  unsigned short show_window;
+  unsigned short reserved2_len;
+  unsigned char *reserved2;
+  void *std_input;
+  void *std_output;
+  void *std_error;
+} RtStartupInfoA;
+
+typedef struct {
+  void *process;
+  void *thread;
+  unsigned process_id;
+  unsigned thread_id;
+} RtProcessInformation;
+
+typedef struct {
+  unsigned length;
+  void *descriptor;
+  int inherit_handle;
+} RtSecurityAttributes;
+
+#define RT_STARTF_USESTDHANDLES 0x100u
+#define RT_HANDLE_FLAG_INHERIT 0x1u
 
 /* ---- shared runtime state ---- */
 
